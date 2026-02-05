@@ -1,0 +1,17 @@
+[project]
+name = "voice-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "faster-whisper>=1.2.1",
+    "langchain>=1.2.8",
+    "langchain-community>=0.4.1",
+    "langchain-ollama>=1.0.1",
+    "numpy>=2.4.2",
+    "piper-tts>=1.4.0",
+    "python-dotenv>=1.2.1",
+    "scipy>=1.17.0",
+    "sounddevice>=0.5.5",
+]
