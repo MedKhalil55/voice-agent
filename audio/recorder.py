@@ -32,12 +32,17 @@ Implementation notes
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
 SAMPLE_RATE_HZ = 16_000
 CHANNELS = 1
 SAMPLE_WIDTH_BYTES = 2  # 16-bit PCM
+
+
+def _env(name: str) -> str:
+    return os.environ.get(name, "")
 
 
 def record_audio(output_path: str, duration: int) -> None:
@@ -74,6 +79,19 @@ def record_audio(output_path: str, duration: int) -> None:
 
     frames = int(SAMPLE_RATE_HZ * duration)
 
+    # Optional: pick a specific input device.
+    # Useful on Windows when the default device is not your microphone.
+    # Accepts either an integer index or a device name string.
+    input_device: int | str | None
+    raw_device = _env("VOICE_AGENT_AUDIO_INPUT_DEVICE").strip()
+    if raw_device:
+        try:
+            input_device = int(raw_device)
+        except ValueError:
+            input_device = raw_device
+    else:
+        input_device = None
+
     # Record returns a NumPy array with shape (frames, channels).
     # dtype=float32 gives normalized samples in roughly [-1.0, 1.0].
     try:
@@ -82,6 +100,7 @@ def record_audio(output_path: str, duration: int) -> None:
             samplerate=SAMPLE_RATE_HZ,
             channels=CHANNELS,
             dtype="float32",
+            device=input_device,
             blocking=True,
         )
     except Exception as exc:  # pragma: no cover

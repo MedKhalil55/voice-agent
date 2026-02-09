@@ -115,11 +115,16 @@ def transcribe_audio(file_path: str) -> str:
     except ValueError:
         beam_size = 1
 
+    language = _env("VOICE_AGENT_WHISPER_LANGUAGE", "").strip() or None
+    task = _env("VOICE_AGENT_WHISPER_TASK", "transcribe").strip() or "transcribe"
+
     try:
         segments, _info = model.transcribe(
             str(audio_path),
             beam_size=beam_size,
             vad_filter=True,
+            language=language,
+            task=task,
         )
     except Exception as exc:  # pragma: no cover
         # Common causes: missing ffmpeg, unsupported codec, invalid file.
