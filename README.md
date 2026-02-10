@@ -29,8 +29,14 @@ VOICE_AGENT_PIPER_CONFIG=voices/en_US-lessac-medium.onnx.json
 VOICE_AGENT_OLLAMA_MODEL=llama3.2
 VOICE_AGENT_OLLAMA_BASE_URL=http://localhost:11434
 VOICE_AGENT_WHISPER_MODEL=small
+VOICE_AGENT_WHISPER_LANGUAGE=en
 VOICE_AGENT_WHISPER_COMPUTE_TYPE=int8
 VOICE_AGENT_WHISPER_BEAM_SIZE=1
+
+# Optional (Windows troubleshooting): force the correct microphone input device.
+# You can set either an integer device index or an exact device name.
+# VOICE_AGENT_AUDIO_INPUT_DEVICE=1
+# VOICE_AGENT_AUDIO_INPUT_DEVICE=Microphone (Realtek(R) Audio)
 ```
 
 Notes:
@@ -46,6 +52,15 @@ uv run main.py
 ```
 
 Outputs are written to the `artifacts/` folder (for example: `artifacts/user.wav` and `artifacts/assistant.wav`).
+
+## Troubleshooting STT (wrong language / hearing the assistant)
+
+- If you speak English but transcription comes out in Arabic/Russian/etc, set:
+	- `VOICE_AGENT_WHISPER_LANGUAGE=en`
+	- and optionally use an English-only model like `VOICE_AGENT_WHISPER_MODEL=small.en`
+- If the transcript sounds like it is hearing the **speaker output** (the assistant) instead of your voice, your input device may be wrong (e.g., Windows “Stereo Mix”).
+	- Listen to `artifacts/user.wav` to confirm what was actually recorded.
+	- Set `VOICE_AGENT_AUDIO_INPUT_DEVICE` to your real microphone.
 
 ## Quick TTS smoke test
 
