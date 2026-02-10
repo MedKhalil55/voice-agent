@@ -127,14 +127,10 @@ def transcribe_audio(file_path: str) -> str:
             task=task,
         )
     except Exception as exc:  # pragma: no cover
-        # Common causes: missing ffmpeg, unsupported codec, invalid file.
         raise RuntimeError(
             "Transcription failed. Ensure the audio file is valid and ffmpeg is installed/available."
         ) from exc
 
-    # Concatenate segments into a single string.
-    # Segmentation is produced by the model's decoding process (often aligned to
-    # pauses/silence via VAD and internal heuristics).
     text_parts: list[str] = []
     for segment in segments:
         segment_text = (segment.text or "").strip()

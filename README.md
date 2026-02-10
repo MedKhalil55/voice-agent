@@ -28,10 +28,22 @@ VOICE_AGENT_PIPER_CONFIG=voices/en_US-lessac-medium.onnx.json
 # Optional
 VOICE_AGENT_OLLAMA_MODEL=llama3.2
 VOICE_AGENT_OLLAMA_BASE_URL=http://localhost:11434
-VOICE_AGENT_WHISPER_MODEL=small
+VOICE_AGENT_WHISPER_MODEL=small.en
 VOICE_AGENT_WHISPER_LANGUAGE=en
 VOICE_AGENT_WHISPER_COMPUTE_TYPE=int8
 VOICE_AGENT_WHISPER_BEAM_SIZE=1
+
+# Audio recording
+# Stop recording when the speaker is silent for N seconds.
+VOICE_AGENT_RECORD_STOP_ON_SILENCE_SECONDS=3
+
+# Optional: maximum recording time per turn when stop-on-silence is enabled.
+# Useful if you speak for a long time without pausing.
+# VOICE_AGENT_RECORD_MAX_SECONDS=30
+
+# Optional tuning
+# VOICE_AGENT_SILENCE_RMS_THRESHOLD=0.01
+# VOICE_AGENT_MIN_RECORD_SECONDS=0.6
 
 # Optional (Windows troubleshooting): force the correct microphone input device.
 # You can set either an integer device index or an exact device name.
@@ -61,6 +73,15 @@ Outputs are written to the `artifacts/` folder (for example: `artifacts/user.wav
 - If the transcript sounds like it is hearing the **speaker output** (the assistant) instead of your voice, your input device may be wrong (e.g., Windows “Stereo Mix”).
 	- Listen to `artifacts/user.wav` to confirm what was actually recorded.
 	- Set `VOICE_AGENT_AUDIO_INPUT_DEVICE` to your real microphone.
+
+## Dynamic recording (stop on silence)
+
+By default, recording can stop automatically when you stop speaking (silence) instead of always waiting a fixed duration.
+
+- Enable: set `VOICE_AGENT_RECORD_STOP_ON_SILENCE_SECONDS=3`
+- If it cuts off while you're still talking: increase `VOICE_AGENT_RECORD_MAX_SECONDS` (e.g., `60`)
+- If it stops too early: lower `VOICE_AGENT_SILENCE_RMS_THRESHOLD` (e.g., `0.005`)
+- If it never stops: increase `VOICE_AGENT_SILENCE_RMS_THRESHOLD` (e.g., `0.02`)
 
 ## Quick TTS smoke test
 

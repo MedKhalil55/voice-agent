@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from time import strftime
@@ -25,6 +26,9 @@ from audio import play_wav, record_audio
 from llm import generate_ai_response
 from stt import transcribe_audio
 from tts import synthesize_speech
+
+
+DEFAULT_RECORD_DURATION_S = 5
 
 
 def _log(message: str) -> None:
@@ -56,8 +60,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--duration",
         type=int,
-        default=5,
-        help="Microphone recording duration per turn (seconds).",
+        default=DEFAULT_RECORD_DURATION_S,
+        help="Microphone recording duration per turn (seconds). If stop-on-silence is enabled, this is the MAX duration.",
     )
     return parser.parse_args()
 
@@ -75,6 +79,47 @@ def main() -> None:
     tts_wav = out_dir / "assistant.wav"
 
     duration_s = max(int(args.duration), 1)
+
+    # If silence-stop recording is enabled, `duration_s` becomes a MAX duration.
+    # With a short max duration (e.g., 5s) you may never reach "3 seconds of
+    # silence" if the user speaks for a couple seconds first. To avoid the
+    # recording always ending at 5s, we automatically bump the max duration.
+    stop_on_silence_raw = os.environ.get(
+        "VOICE_AGENT_RECORD_STOP_ON_SILENCE_SECONDS", ""
+    ).strip()
+    silence_seconds = 0.0
+    if stop_on_silence_raw:
+        try:
+            silence_seconds = max(float(stop_on_silence_raw), 0.0)
+        except ValueError:
+            silence_seconds = 0.0
+
+    if silence_seconds > 0:
+        # In stop-on-silence mode, `--duration` is interpreted as a MAX duration.
+        # If the user didn't override `--duration`, we use a more generous default
+        # to avoid cutting off longer utterances.
+        max_raw = os.environ.get("VOICE_AGENT_RECORD_MAX_SECONDS", "").strip()
+        max_env_s = 0
+        if max_raw:
+            try:
+                max_env_s = int(float(max_raw))
+            except ValueError:
+                max_env_s = 0
+
+        if max_env_s > 0:
+            duration_s = max(max_env_s, 1)
+        elif int(args.duration) == DEFAULT_RECORD_DURATION_S:
+            duration_s = 30
+
+        min_max_duration = int(silence_seconds) + 7  # buffer for speaking time
+        if duration_s < min_max_duration:
+            duration_s = min_max_duration
+
+        _log(
+            f"Recording mode: stop-on-silence ({silence_seconds:.1f}s). Max duration per turn: {duration_s}s"
+        )
+    else:
+        _log(f"Recording mode: fixed window. Duration per turn: {duration_s}s")
 
     bye_keywords = {
         "bye",
