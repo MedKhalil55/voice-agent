@@ -25,7 +25,11 @@ We intentionally avoid agent tool-use frameworks at this stage.
 from __future__ import annotations
 
 import os
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
 from functools import lru_cache
+from typing import Deque, List, Tuple
 
 
 def _env(name: str, default: str) -> str:
@@ -75,6 +79,212 @@ def _build_system_prompt() -> str:
         "Grounding:\n"
         "- If you are unsure, say so briefly and suggest what information is needed.\n"
     )
+
+
+class ConversationState(str, Enum):
+    """Explicit, lightweight state machine for a banking call."""
+
+    INTRO = "INTRO"
+    DISCOVERY = "DISCOVERY"
+    NEGOTIATION = "NEGOTIATION"
+    CLOSING = "CLOSING"
+
+
+def _normalize(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def _parse_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(float(raw))
+    except ValueError:
+        return default
+
+
+def _state_guidance(state: ConversationState) -> str:
+    """State-specific prompt guidance.
+
+    This is intentionally short and voice-oriented.
+    """
+
+    if state == ConversationState.INTRO:
+        return (
+            "Call state: INTRO.\n"
+            "Goal: establish why you're calling and what the user needs help with.\n"
+            "Next action: ask one focused question to route the request (e.g., account type/topic).\n"
+            "Tone: professional, calm, brief.\n"
+        )
+
+    if state == ConversationState.DISCOVERY:
+        return (
+            "Call state: DISCOVERY.\n"
+            "Goal: collect only the minimum non-sensitive details needed to help.\n"
+            "Next action: ask at most one clarifying question (amount range, due date, product type), then give a short plan.\n"
+            "Tone: supportive, practical.\n"
+        )
+
+    if state == ConversationState.NEGOTIATION:
+        return (
+            "Call state: NEGOTIATION.\n"
+            "Goal: propose realistic options (installments, hardship support, payment timing) and confirm constraints.\n"
+            "Next action: propose one option + ask for confirmation or a budget number (without requesting sensitive credentials).\n"
+            "Tone: collaborative and solution-focused.\n"
+        )
+
+    return (
+        "Call state: CLOSING.\n"
+        "Goal: summarize what was decided and the next safe step via official channels.\n"
+        "Next action: confirm if they need anything else, then provide a brief closing line.\n"
+        "Tone: warm and concise.\n"
+    )
+
+
+def _infer_next_state(
+    current: ConversationState,
+    user_text: str,
+    assistant_text: str | None = None,
+) -> ConversationState:
+    """Heuristic state transitions.
+
+    We keep this rule-based for predictability and to avoid adding tool/agent complexity.
+    """
+
+    u = _normalize(user_text)
+    a = _normalize(assistant_text or "")
+
+    closing_signals = (
+        "thanks",
+        "thank you",
+        "that helps",
+        "that's all",
+        "that is all",
+        "no that's all",
+        "no thats all",
+        "goodbye",
+        "bye",
+        "see you",
+        "see you later",
+    )
+
+    negotiation_signals = (
+        "installment",
+        "installments",
+        "payment plan",
+        "plan",
+        "can't pay",
+        "cannot pay",
+        "struggling",
+        "hardship",
+        "late fee",
+        "overdue",
+        "past due",
+        "minimum payment",
+        "due date",
+        "defer",
+        "deferral",
+        "reduce payment",
+    )
+
+    if any(s in u for s in closing_signals):
+        return ConversationState.CLOSING
+
+    if current == ConversationState.INTRO:
+        # After the first user response, we generally move into discovery.
+        if u:
+            return ConversationState.DISCOVERY
+
+    if current in (ConversationState.DISCOVERY, ConversationState.INTRO):
+        if any(s in u for s in negotiation_signals):
+            return ConversationState.NEGOTIATION
+
+    if current == ConversationState.NEGOTIATION:
+        # If the assistant has summarized an option and the user is agreeable, close.
+        agree = ("yes", "ok", "okay", "sounds good", "that works", "agree")
+        if any(s in u for s in agree) and (
+            "next step" in a or "we can" in a or "option" in a
+        ):
+            return ConversationState.CLOSING
+
+    return current
+
+
+@dataclass
+class ConversationSession:
+    """In-process state + bounded memory for one call.
+
+    Memory resets when the program exits (call ends). A manual reset function
+    is also provided for future reuse.
+    """
+
+    max_turns: int = 5
+    state: ConversationState = ConversationState.INTRO
+    # Store (user, assistant) turns. We keep turns (not raw messages) so we can
+    # trim in pairs.
+    turns: Deque[Tuple[str, str]] = field(default_factory=deque)
+
+    def reset(self) -> None:
+        self.state = ConversationState.INTRO
+        self.turns.clear()
+
+    def append_turn(self, user_text: str, assistant_text: str) -> None:
+        self.turns.append((user_text, assistant_text))
+        while len(self.turns) > max(self.max_turns, 1):
+            self.turns.popleft()
+        self.state = _infer_next_state(self.state, user_text, assistant_text)
+
+    def build_messages(self, user_text: str):
+        """Build chat messages including bounded history + state guidance."""
+
+        try:
+            from langchain_core.messages import (  # type: ignore
+                AIMessage,
+                HumanMessage,
+                SystemMessage,
+            )
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError(
+                "LangChain core messages are not available. Install `langchain` (and `langchain-core` if needed)."
+            ) from exc
+
+        # State can also transition based on the new user text.
+        state_for_prompt = _infer_next_state(self.state, user_text)
+
+        system = _build_system_prompt() + "\n" + _state_guidance(state_for_prompt)
+
+        messages: List[object] = [SystemMessage(content=system)]
+
+        # Include last N turns as alternating user/assistant messages.
+        for u, a in self.turns:
+            messages.append(HumanMessage(content=u))
+            messages.append(AIMessage(content=a))
+
+        messages.append(HumanMessage(content=user_text))
+        return messages
+
+
+_SESSION: ConversationSession | None = None
+
+
+def _get_session() -> ConversationSession:
+    global _SESSION
+    if _SESSION is None:
+        # Requirement: keep the last N turns (typical 4–6). Default to 5.
+        max_turns = _parse_int_env("VOICE_AGENT_MEMORY_TURNS", 5)
+        max_turns = max(1, min(max_turns, 12))
+        _SESSION = ConversationSession(max_turns=max_turns)
+    return _SESSION
+
+
+def reset_conversation() -> None:
+    """Reset conversation state/memory for a new call."""
+
+    global _SESSION
+    if _SESSION is not None:
+        _SESSION.reset()
+    _SESSION = None
 
 
 @lru_cache(maxsize=1)
@@ -156,23 +366,17 @@ def generate_ai_response(user_text: str) -> str:
     if not text:
         return "I didn't catch that. What would you like help with?"
 
-    try:
-        from langchain_core.messages import HumanMessage, SystemMessage  # type: ignore
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError(
-            "LangChain core messages are not available. Install `langchain` (and `langchain-core` if needed)."
-        ) from exc
-
     chat = _get_chat_model()
 
-    messages = [
-        SystemMessage(content=_build_system_prompt()),
-        HumanMessage(content=text),
-    ]
+    session = _get_session()
+    messages = session.build_messages(text)
 
     # `.invoke()` is the simplest LangChain execution method for a single turn.
     # It returns an AIMessage-like object with `.content`.
     response = chat.invoke(messages)
 
     content = getattr(response, "content", "")
-    return (content or "").strip() or "Sorry — I couldn't generate a response."
+
+    final_text = (content or "").strip() or "Sorry — I couldn't generate a response."
+    session.append_turn(text, final_text)
+    return final_text
