@@ -18,7 +18,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from time import strftime
+from time import sleep, strftime
 
 from dotenv import load_dotenv
 
@@ -29,6 +29,11 @@ from tts import synthesize_speech
 
 
 DEFAULT_RECORD_DURATION_S = 5
+
+OUTBOUND_GREETING = (
+    "Hello, this is the automated banking assistant calling regarding your account. "
+    "How can I help you today?"
+)
 
 
 def _log(message: str) -> None:
@@ -132,7 +137,7 @@ def main() -> None:
         "see you later",
     }
 
-    _log("Voice agent ready. Speak normally; say 'bye' to exit.")
+    _log("Voice agent ready. Say 'bye' to exit.")
 
     session_summary: dict = {
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -141,6 +146,23 @@ def main() -> None:
         "turns": [],
         "ended_reason": None,
     }
+
+    # Outbound-call behavior: the assistant starts the conversation.
+    _log("Greeting: synthesizing speech...")
+    synthesize_speech(OUTBOUND_GREETING, str(tts_wav))
+    _log("Greeting: playing audio...")
+    play_wav(str(tts_wav))
+    session_summary["turns"].append(
+        {
+            "user_text": None,
+            "assistant_text": OUTBOUND_GREETING,
+            "exit": False,
+            "event": "greeting",
+        }
+    )
+    # Small buffer so playback tail doesn't immediately leak into the next recording.
+    if not args.demo:
+        sleep(0.25)
 
     demo_script = [
         "Hello.",
@@ -216,17 +238,9 @@ def main() -> None:
                     }
                 )
 
-                # Optional console control: type 'bye' to exit without speaking.
+                # Continuous loop: immediately go to the next recording.
                 if not args.demo:
-                    typed = (
-                        input("Press Enter to talk again (or type 'bye' to quit): ")
-                        .strip()
-                        .lower()
-                    )
-                    if typed in bye_keywords:
-                        session_summary["ended_reason"] = "user_typed_bye"
-                        _log("Exiting...")
-                        break
+                    sleep(0.25)
 
             except Exception as exc:
                 _log(f"Error: {exc}")
@@ -238,12 +252,9 @@ def main() -> None:
                     session_summary["ended_reason"] = "error_in_demo"
                     break
 
-                typed = (
-                    input("Type 'retry' to continue or 'bye' to quit: ").strip().lower()
-                )
-                if typed in bye_keywords:
-                    session_summary["ended_reason"] = "user_quit_after_error"
-                    break
+                # In mic mode, keep running unless the user says an exit intent.
+                sleep(0.5)
+                continue
 
     except KeyboardInterrupt:
         session_summary["ended_reason"] = "keyboard_interrupt"
