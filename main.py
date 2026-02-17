@@ -31,8 +31,8 @@ from tts import synthesize_speech
 DEFAULT_RECORD_DURATION_S = 5
 
 OUTBOUND_GREETING = (
-    "Hello, this is the automated banking assistant calling regarding your account. "
-    "How can I help you today?"
+    "Bonjour, je suis l’assistant bancaire automatique et je vous appelle au sujet de votre compte. "
+    "Comment puis-je vous aider aujourd’hui ?"
 )
 
 
@@ -72,9 +72,20 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    load_dotenv()
+    # Important on Windows/PowerShell: environment variables may already be set
+    # in the shell/session. We want the project's `.env` to take precedence so
+    # switching voices (e.g., EN -> FR) actually applies.
+    load_dotenv(override=True)
 
     args = _parse_args()
+
+    # Debug visibility: confirm which Piper voice paths are active.
+    piper_model = os.environ.get("VOICE_AGENT_PIPER_MODEL", "").strip()
+    piper_config = os.environ.get("VOICE_AGENT_PIPER_CONFIG", "").strip()
+    if piper_model:
+        _log(f"TTS voice model: {piper_model}")
+    if piper_config:
+        _log(f"TTS voice config: {piper_config}")
 
     # Keep artifacts local and easy to inspect.
     out_dir = Path("artifacts")
@@ -127,17 +138,21 @@ def main() -> None:
         _log(f"Recording mode: fixed window. Duration per turn: {duration_s}s")
 
     bye_keywords = {
-        "bye",
-        "goodbye",
-        "good bye",
-        "exit",
-        "quit",
-        "stop",
-        "see you",
-        "see you later",
+        "au revoir",
+        "aurevoir",
+        "bonne journée",
+        "à bientôt",
+        "a bientot",
+        "à plus tard",
+        "a plus tard",
+        "merci, au revoir",
+        "terminer",
+        "quitter",
+        "arrêter",
+        "arreter",
     }
 
-    _log("Voice agent ready. Say 'bye' to exit.")
+    _log("Assistant prêt. Dites « au revoir » pour terminer.")
 
     session_summary: dict = {
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -165,11 +180,11 @@ def main() -> None:
         sleep(0.25)
 
     demo_script = [
-        "Hello.",
-        "I received a payment reminder and I can't pay the full amount this month.",
-        "Can you propose an installment plan?",
-        "Please call me back next week.",
-        "bye",
+        "Bonjour.",
+        "J'ai reçu un rappel de paiement et je ne peux pas régler la totalité ce mois-ci.",
+        "Pouvez-vous me proposer un plan de paiement en plusieurs fois ?",
+        "Pouvez-vous me rappeler la semaine prochaine ?",
+        "au revoir",
     ]
 
     try:
@@ -197,7 +212,8 @@ def main() -> None:
                     k in normalized for k in bye_keywords
                 ):
                     farewell = (
-                        "Goodbye! If you need banking help later, just come back."
+                        "Au revoir et merci de votre appel. "
+                        "Si vous avez besoin d'aide, n'hésitez pas à nous recontacter."
                     )
                     _log("Detected exit keyword. Closing conversation...")
                     _log("Step 4/5: synthesizing speech...")

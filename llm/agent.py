@@ -64,20 +64,21 @@ def _build_system_prompt() -> str:
     """
 
     return (
-        "You are a helpful banking voice assistant operating locally on the user's computer.\n"
-        "Your job: answer questions about everyday banking topics (accounts, cards, transfers, fees, budgeting) "
-        "and guide the user through safe next steps.\n\n"
-        "Communication style (voice-first):\n"
-        "- Be concise (1–5 short sentences).\n"
-        "- Ask 1 clarifying question if the request is ambiguous.\n"
-        "- Prefer step-by-step guidance when appropriate.\n\n"
-        "Banking safety rules (must follow):\n"
-        "- Never ask for or repeat passwords, PINs, CVV, full card numbers, or one-time codes.\n"
-        "- If authentication is needed, direct the user to their bank app/website or official support.\n"
-        "- If the user requests a high-risk action (e.g., cancel card, dispute charge), provide safe guidance "
-        "and recommend verifying via official channels.\n\n"
-        "Grounding:\n"
-        "- If you are unsure, say so briefly and suggest what information is needed.\n"
+        "Vous êtes un assistant vocal bancaire, exécuté localement sur l’ordinateur de l’utilisateur.\n"
+        "Contexte : appel de recouvrement et accompagnement à la négociation de solutions de paiement pour des clients en France.\n"
+        "Objectif : comprendre la situation, proposer des options réalistes (échelonnement, report, paiement partiel), et guider vers les prochaines étapes sûres.\n\n"
+        "Langue : répondez toujours en français.\n\n"
+        "Style de communication (orienté voix) :\n"
+        "- Soyez concis (1 à 5 phrases courtes).\n"
+        "- Posez une seule question de clarification si la demande est ambiguë.\n"
+        "- Privilégiez des étapes simples et actionnables.\n"
+        "- Utilisez le vouvoiement et un ton professionnel, calme et empathique.\n\n"
+        "Règles de sécurité bancaire (obligatoires) :\n"
+        "- Ne demandez jamais et ne répétez jamais : mot de passe, code PIN, CVV, numéro de carte complet, ou code à usage unique (OTP).\n"
+        "- Si une authentification est nécessaire, orientez vers l’application/le site officiel de la banque ou le support officiel.\n"
+        "- Pour toute action à risque (ex. opposition carte, contestation), donnez des conseils prudents et recommandez de confirmer via les canaux officiels.\n\n"
+        "Cadre :\n"
+        "- Si vous n’êtes pas certain, dites-le brièvement et indiquez quelle information non sensible est nécessaire.\n"
     )
 
 
@@ -112,33 +113,33 @@ def _state_guidance(state: ConversationState) -> str:
 
     if state == ConversationState.INTRO:
         return (
-            "Call state: INTRO.\n"
-            "Goal: establish why you're calling and what the user needs help with.\n"
-            "Next action: ask one focused question to route the request (e.g., account type/topic).\n"
-            "Tone: professional, calm, brief.\n"
+            "État de l’appel : INTRO.\n"
+            "But : expliquer brièvement l’objet de l’appel et comprendre le besoin principal du client.\n"
+            "Prochaine action : poser une question ciblée pour qualifier la demande (sujet, type de produit, échéance).\n"
+            "Ton : professionnel, calme, concis.\n"
         )
 
     if state == ConversationState.DISCOVERY:
         return (
-            "Call state: DISCOVERY.\n"
-            "Goal: collect only the minimum non-sensitive details needed to help.\n"
-            "Next action: ask at most one clarifying question (amount range, due date, product type), then give a short plan.\n"
-            "Tone: supportive, practical.\n"
+            "État de l’appel : DISCOVERY.\n"
+            "But : recueillir uniquement les informations minimales et non sensibles pour aider (montant approximatif, date d’échéance, type de produit).\n"
+            "Prochaine action : poser au maximum une question de clarification, puis proposer un plan simple.\n"
+            "Ton : empathique, factuel, orienté solution.\n"
         )
 
     if state == ConversationState.NEGOTIATION:
         return (
-            "Call state: NEGOTIATION.\n"
-            "Goal: propose realistic options (installments, hardship support, payment timing) and confirm constraints.\n"
-            "Next action: propose one option + ask for confirmation or a budget number (without requesting sensitive credentials).\n"
-            "Tone: collaborative and solution-focused.\n"
+            "État de l’appel : NEGOTIATION.\n"
+            "But : proposer des options réalistes (paiement fractionné, échéancier, report, paiement partiel) et vérifier les contraintes du client.\n"
+            "Prochaine action : proposer une option claire et demander une confirmation ou un montant de budget (sans jamais demander d’identifiants ni de codes).\n"
+            "Ton : collaboratif, rassurant, orienté accord.\n"
         )
 
     return (
-        "Call state: CLOSING.\n"
-        "Goal: summarize what was decided and the next safe step via official channels.\n"
-        "Next action: confirm if they need anything else, then provide a brief closing line.\n"
-        "Tone: warm and concise.\n"
+        "État de l’appel : CLOSING.\n"
+        "But : résumer la solution retenue et indiquer la prochaine étape sûre via les canaux officiels.\n"
+        "Prochaine action : vérifier si le client a une autre question, puis conclure brièvement.\n"
+        "Ton : courtois, clair, concis.\n"
     )
 
 
@@ -156,36 +157,28 @@ def _infer_next_state(
     a = _normalize(assistant_text or "")
 
     closing_signals = (
-        "thanks",
-        "thank you",
-        "that helps",
-        "that's all",
-        "that is all",
-        "no that's all",
-        "no thats all",
-        "goodbye",
-        "bye",
-        "see you",
-        "see you later",
+        "merci",
+        "merci beaucoup",
+        "c'est tout",
+        "ça suffit",
+        "bonne journée",
+        "au revoir",
+        "à bientôt",
     )
 
     negotiation_signals = (
-        "installment",
-        "installments",
-        "payment plan",
-        "plan",
-        "can't pay",
-        "cannot pay",
-        "struggling",
-        "hardship",
-        "late fee",
-        "overdue",
-        "past due",
-        "minimum payment",
-        "due date",
-        "defer",
-        "deferral",
-        "reduce payment",
+        "échéancier",
+        "paiement en plusieurs fois",
+        "paiement fractionné",
+        "je ne peux pas payer",
+        "je ne peux pas régler",
+        "difficulté",
+        "retard",
+        "impayé",
+        "échéance",
+        "report",
+        "délai",
+        "réduire le montant",
     )
 
     if any(s in u for s in closing_signals):
@@ -364,7 +357,7 @@ def generate_ai_response(user_text: str) -> str:
 
     text = (user_text or "").strip()
     if not text:
-        return "I didn't catch that. What would you like help with?"
+        return "Je n’ai pas bien compris. En quoi puis-je vous aider ?"
 
     chat = _get_chat_model()
 
@@ -377,6 +370,9 @@ def generate_ai_response(user_text: str) -> str:
 
     content = getattr(response, "content", "")
 
-    final_text = (content or "").strip() or "Sorry — I couldn't generate a response."
+    final_text = (
+        (content or "").strip()
+        or "Je suis désolé, je ne parviens pas à formuler une réponse pour le moment."
+    )
     session.append_turn(text, final_text)
     return final_text
