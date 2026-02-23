@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from time import sleep, strftime
@@ -38,6 +39,50 @@ OUTBOUND_GREETING = (
 
 def _log(message: str) -> None:
     print(f"[{strftime('%H:%M:%S')}] {message}")
+
+
+def clean_for_tts(text: str) -> str:
+    """Post-process text to sound natural when spoken.
+
+    - Strips common Markdown formatting (bold/italic, headings, bullets)
+    - Removes numbered list prefixes (e.g., "1. ")
+    - Removes special symbols used for formatting (e.g., "#", "**")
+    - Turns multiple newlines into a natural pause (". ")
+    """
+
+    value = (text or "").strip()
+    if not value:
+        return ""
+
+    # Normalize line endings first.
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Remove fenced code block markers and inline code backticks.
+    value = value.replace("```", "")
+    value = value.replace("`", "")
+
+    # Remove common emphasis markers.
+    value = re.sub(r"(\*\*|__)(.+?)(\1)", r"\2", value)
+    value = re.sub(r"(\*|_)(.+?)(\1)", r"\2", value)
+
+    # Strip Markdown structural prefixes line-by-line.
+    value = re.sub(r"^\s*#+\s+", "", value, flags=re.MULTILINE)  # headings
+    value = re.sub(r"^\s*>\s+", "", value, flags=re.MULTILINE)  # blockquotes
+    value = re.sub(r"^\s*[-*+]\s+", "", value, flags=re.MULTILINE)  # bullets
+    value = re.sub(r"^\s*\d+[\.)]\s+", "", value, flags=re.MULTILINE)  # numbered
+
+    # Remove leftover formatting symbols that tend to be read aloud badly.
+    value = value.replace("#", " ")
+    value = value.replace("*", " ")
+    value = value.replace("_", " ")
+
+    # Replace multiple newlines with a pause, then remaining newlines with spaces.
+    value = re.sub(r"\n\s*\n+", ". ", value)
+    value = value.replace("\n", " ")
+
+    # Collapse whitespace.
+    value = re.sub(r"\s{2,}", " ", value).strip()
+    return value
 
 
 def _utc_timestamp_for_filename() -> str:
@@ -164,7 +209,7 @@ def main() -> None:
 
     # Outbound-call behavior: the assistant starts the conversation.
     _log("Greeting: synthesizing speech...")
-    synthesize_speech(OUTBOUND_GREETING, str(tts_wav))
+    synthesize_speech(clean_for_tts(OUTBOUND_GREETING), str(tts_wav))
     _log("Greeting: playing audio...")
     play_wav(str(tts_wav))
     session_summary["turns"].append(
@@ -217,7 +262,7 @@ def main() -> None:
                     )
                     _log("Detected exit keyword. Closing conversation...")
                     _log("Step 4/5: synthesizing speech...")
-                    synthesize_speech(farewell, str(tts_wav))
+                    synthesize_speech(clean_for_tts(farewell), str(tts_wav))
                     _log("Step 5/5: playing audio...")
                     play_wav(str(tts_wav))
 
@@ -240,7 +285,7 @@ def main() -> None:
                 _log(f"Assistant text: {response_text!r}")
 
                 _log("Step 4/5: synthesizing speech...")
-                synthesize_speech(response_text, str(tts_wav))
+                synthesize_speech(clean_for_tts(response_text), str(tts_wav))
                 _log(f"Synthesized: {tts_wav}")
 
                 _log("Step 5/5: playing audio...")

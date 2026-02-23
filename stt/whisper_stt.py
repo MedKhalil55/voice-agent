@@ -42,7 +42,7 @@ def _env(name: str, default: str) -> str:
 # - `int8` quantization reduces memory bandwidth and can be significantly faster
 #   on typical CPUs for Whisper inference.
 # - Beam size 1 == greedy decoding (fastest). You can increase later for quality.
-_DEFAULT_DEVICE = "cpu"
+_DEFAULT_DEVICE = "cuda"
 
 
 @lru_cache(maxsize=1)
@@ -63,8 +63,8 @@ def _get_model():
 
     cpu_threads = os.cpu_count() or 4
 
-    model_name = _env("VOICE_AGENT_WHISPER_MODEL", "small")
-    compute_type = _env("VOICE_AGENT_WHISPER_COMPUTE_TYPE", "int8")
+    model_name = _env("VOICE_AGENT_WHISPER_MODEL", "large-v3")
+    compute_type = _env("VOICE_AGENT_WHISPER_COMPUTE_TYPE", "float16")
 
     # `num_workers` controls internal dataloader/decoder workers.
     # Keep modest by default; adjust later based on profiling.
