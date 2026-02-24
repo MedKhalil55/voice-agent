@@ -1,11 +1,12 @@
-"""Speech-to-Text (STT) using faster-whisper (local, CPU-optimized).
+"""Speech-to-Text (STT) using faster-whisper (local, GPU-accelerated with fallback).
 
 This module provides a minimal, *academic-style* STT pipeline wrapper around
 `faster-whisper`.
 
 Why faster-whisper?
 - It uses CTranslate2 for efficient Whisper inference.
-- It supports CPU quantization (e.g., int8) for faster local execution.
+- It supports CUDA acceleration on NVIDIA GPUs for real-time transcription.
+- It supports CPU quantization (e.g., int8) as a robust fallback for local execution.
 - It can ingest common audio formats via ffmpeg decoding.
 
 STT pipeline (conceptual overview)
@@ -24,8 +25,13 @@ Note:
 from __future__ import annotations
 
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
+
+
+# Runtime override used to force CPU after a CUDA failure (e.g., missing DLLs).
+_RUNTIME_FORCE_DEVICE: str | None = None
 
 
 def _env(name: str, default: str) -> str:
@@ -38,11 +44,154 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
-# CPU-friendly defaults.
-# - `int8` quantization reduces memory bandwidth and can be significantly faster
-#   on typical CPUs for Whisper inference.
-# - Beam size 1 == greedy decoding (fastest). You can increase later for quality.
-_DEFAULT_DEVICE = "cuda"
+def _cuda_is_available() -> bool:
+    """Return True if CTranslate2 reports at least one CUDA device.
+
+    Academic note:
+    faster-whisper uses CTranslate2 under the hood. The most reliable way to
+    detect CUDA availability is to ask CTranslate2 directly.
+    """
+
+    try:
+        import ctranslate2  # type: ignore
+
+        get_count = getattr(ctranslate2, "get_cuda_device_count", None)
+        if callable(get_count):
+            return int(get_count()) > 0
+    except Exception:
+        return False
+
+    return False
+
+
+def _select_device_and_compute_type() -> tuple[str, str]:
+    """Select an execution device and compute type.
+
+    Defaults (production-ready banking transcription):
+    - Prefer GPU: device=cuda, compute_type=float16 (fast + accurate on NVIDIA)
+    - Fallback: device=cpu, compute_type=int8 (robust on any machine)
+
+    Env overrides:
+    - VOICE_AGENT_WHISPER_DEVICE: 'cuda' or 'cpu'
+    - VOICE_AGENT_WHISPER_COMPUTE_TYPE: ctranslate2 compute type
+    """
+
+    requested_device = os.environ.get("VOICE_AGENT_WHISPER_DEVICE", "").strip().lower()
+    requested_compute = os.environ.get("VOICE_AGENT_WHISPER_COMPUTE_TYPE", "").strip()
+
+    cuda_ok = _cuda_is_available()
+
+    # Device selection (prefer CUDA), with a runtime safety override.
+    forced = (_RUNTIME_FORCE_DEVICE or "").strip().lower()
+    if forced in {"cuda", "cpu"}:
+        device = forced
+    elif requested_device in {"cuda", "cpu"}:
+        device = requested_device
+    else:
+        device = "cuda" if cuda_ok else "cpu"
+
+    # Requirement: if CUDA is not available, fall back automatically.
+    if device == "cuda" and not cuda_ok:
+        device = "cpu"
+
+    # Compute type defaults.
+    default_compute = "float16" if device == "cuda" else "int8"
+    compute_type = requested_compute or default_compute
+
+    # Make CPU fallback robust even if the user left a GPU-oriented compute type.
+    if device == "cpu" and compute_type.lower() in {"float16", "int8_float16"}:
+        compute_type = "int8"
+
+    return device, compute_type
+
+
+def _looks_like_cuda_runtime_error(exc: Exception) -> bool:
+    """Heuristically detect missing CUDA runtime dependencies.
+
+    On Windows, this often manifests as missing DLLs like cublas64_12.dll.
+    """
+
+    message = str(exc).lower()
+    needles = (
+        "cublas",
+        "cudnn",
+        "cudart",
+        "cuda",
+        "dll is not found",
+        "cannot be loaded",
+    )
+    return any(n in message for n in needles)
+
+
+def _parse_int_env(name: str, default: int) -> int:
+    raw = _env(name, str(default)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _parse_float_env(name: str, default: float) -> float:
+    raw = _env(name, str(default)).strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _postprocess_french_banking_text(text: str) -> str:
+    """Normalize and correct common French banking transcription artifacts.
+
+    Design goals:
+    - Fix common lexical errors on banking vocabulary.
+    - Normalize whitespace/punctuation for downstream NLU/LLM.
+    - Preserve numeric and currency expressions.
+    """
+
+    value = (text or "").strip()
+    if not value:
+        return ""
+
+    # Normalize whitespace first.
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    value = re.sub(r"\s+", " ", value).strip()
+
+    # Common ASR vocabulary corrections (French banking domain).
+    # Keep replacements conservative to avoid altering unrelated phrasing.
+    corrections: list[tuple[str, str]] = [
+        (r"\bcarte\s+bleu\b", "carte bleue"),
+        (r"\bviremant\b", "virement"),
+        (r"\bvirment\b", "virement"),
+        (r"\béchéansier\b", "échéancier"),
+        (r"\becheansier\b", "échéancier"),
+        (r"\bmensualitee\b", "mensualité"),
+        (r"\bmensualitee\b", "mensualité"),
+        (r"\bprelevement\b", "prélèvement"),
+        (r"\bprelevements\b", "prélèvements"),
+        (r"\bprélèvement\s+auto\b", "prélèvement automatique"),
+        (r"\binteret\b", "intérêt"),
+        (r"\bagios\b", "agios"),
+        (r"\bdecuvert\b", "découvert"),
+        (r"\bdecouvert\b", "découvert"),
+        (r"\bsepa\b", "SEPA"),
+        (r"\bi\s*ban\b", "IBAN"),
+        (r"\bb\s*i\s*c\b", "BIC"),
+        (r"\br\s*i\s*b\b", "RIB"),
+    ]
+    for pattern, replacement in corrections:
+        value = re.sub(pattern, replacement, value, flags=re.IGNORECASE)
+
+    # Preserve/normalize currency spacing without altering numeric content.
+    value = re.sub(r"(\d)\s*€", r"\1 €", value)
+    value = re.sub(r"€\s*(\d)", r"€ \1", value)
+    value = re.sub(r"\b(euro|euros)\b", "euros", value, flags=re.IGNORECASE)
+
+    # Normalize punctuation spacing carefully (do not break numeric formats).
+    value = re.sub(r"\s+([;:!?])", r"\1", value)
+    value = re.sub(r"([;:!?])(\S)", r"\1 \2", value)
+    value = re.sub(r"\s{2,}", " ", value).strip()
+
+    return value
 
 
 @lru_cache(maxsize=1)
@@ -63,18 +212,52 @@ def _get_model():
 
     cpu_threads = os.cpu_count() or 4
 
-    model_name = _env("VOICE_AGENT_WHISPER_MODEL", "large-v3")
-    compute_type = _env("VOICE_AGENT_WHISPER_COMPUTE_TYPE", "float16")
+    # Why GPU?
+    # - CUDA provides higher throughput and lower latency for real-time voice agents.
+    # - float16 is typically the best accuracy/speed trade-off on NVIDIA GPUs.
+    # - We keep an automatic CPU int8 fallback to stay production-robust.
+    device, compute_type = _select_device_and_compute_type()
+
+    # Why 'medium'?
+    # - 'medium' is a strong quality baseline for French in noisy call audio.
+    # - It is lighter than very large models, improving latency for voice UX.
+    model_name = _env("VOICE_AGENT_WHISPER_MODEL", "medium")
+
+    log_device = _env("VOICE_AGENT_STT_LOG_DEVICE", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if log_device:
+        print(
+            f"[stt] faster-whisper: model={model_name}, device={device}, compute_type={compute_type}"
+        )
 
     # `num_workers` controls internal dataloader/decoder workers.
     # Keep modest by default; adjust later based on profiling.
-    return WhisperModel(
-        model_name,
-        device=_DEFAULT_DEVICE,
-        compute_type=compute_type,
-        cpu_threads=cpu_threads,
-        num_workers=1,
-    )
+    try:
+        return WhisperModel(
+            model_name,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=cpu_threads,
+            num_workers=1,
+        )
+    except Exception as exc:
+        # If CUDA path fails at runtime (missing drivers, incompatible build,
+        # etc.), fallback to CPU int8 automatically.
+        if device == "cuda":
+            if log_device:
+                print("[stt] CUDA init failed; falling back to CPU (int8).")
+            return WhisperModel(
+                model_name,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=cpu_threads,
+                num_workers=1,
+            )
+        raise exc
 
 
 def transcribe_audio(file_path: str) -> str:
@@ -104,37 +287,86 @@ def transcribe_audio(file_path: str) -> str:
     that we then concatenate to form a single transcript.
     """
 
+    global _RUNTIME_FORCE_DEVICE
+
     audio_path = Path(file_path)
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
     model = _get_model()
 
-    try:
-        beam_size = int(_env("VOICE_AGENT_WHISPER_BEAM_SIZE", "1"))
-    except ValueError:
-        beam_size = 1
+    # Why beam search?
+    # - beam_size=5 + best_of=5 improves decoding stability and accuracy,
+    #   especially on short banking utterances (names, amounts, payment terms).
+    # - temperature=0.0 encourages deterministic decoding, which is desirable
+    #   for production voice pipelines.
+    beam_size = _parse_int_env("VOICE_AGENT_WHISPER_BEAM_SIZE", 5)
+    best_of = _parse_int_env("VOICE_AGENT_WHISPER_BEST_OF", 5)
+    temperature = _parse_float_env("VOICE_AGENT_WHISPER_TEMPERATURE", 0.0)
 
-    language = _env("VOICE_AGENT_WHISPER_LANGUAGE", "").strip() or None
+    condition_on_previous_text = _env(
+        "VOICE_AGENT_WHISPER_CONDITION_ON_PREVIOUS_TEXT", "true"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+
+    # Default to French for stability in a France banking call context.
+    lang_raw = _env("VOICE_AGENT_WHISPER_LANGUAGE", "fr").strip()
+    language = None if lang_raw.lower() in {"", "auto", "none"} else lang_raw
     task = _env("VOICE_AGENT_WHISPER_TASK", "transcribe").strip() or "transcribe"
 
-    try:
-        segments, _info = model.transcribe(
+    def _transcribe_once(active_model):
+        segments, _info = active_model.transcribe(
             str(audio_path),
             beam_size=beam_size,
+            best_of=best_of,
+            temperature=temperature,
+            condition_on_previous_text=condition_on_previous_text,
             vad_filter=True,
             language=language,
             task=task,
         )
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError(
-            "Transcription failed. Ensure the audio file is valid and ffmpeg is installed/available."
-        ) from exc
+        # Important: `segments` is a lazy generator. Runtime CUDA/DLL errors can
+        # occur during iteration, so force evaluation inside the try/except.
+        return list(segments)
+
+    try:
+        segments_list = _transcribe_once(model)
+    except Exception as exc:
+        # Production robustness: if CUDA is selected but runtime DLLs are missing
+        # (common on Windows), fall back to CPU int8 and retry once.
+        if (
+            _RUNTIME_FORCE_DEVICE or ""
+        ).strip().lower() != "cpu" and _looks_like_cuda_runtime_error(exc):
+            log_device = _env(
+                "VOICE_AGENT_STT_LOG_DEVICE", "true"
+            ).strip().lower() not in {
+                "0",
+                "false",
+                "no",
+                "off",
+            }
+            if log_device:
+                print(
+                    "[stt] CUDA runtime error detected (often missing DLLs). Retrying on CPU (int8)."
+                )
+            _RUNTIME_FORCE_DEVICE = "cpu"
+            _get_model.cache_clear()
+            model = _get_model()
+            try:
+                segments_list = _transcribe_once(model)
+            except Exception as exc2:
+                raise RuntimeError(
+                    "Transcription failed after CUDA fallback. Ensure the audio file is valid and ffmpeg is installed/available."
+                ) from exc2
+        else:
+            raise RuntimeError(
+                "Transcription failed. Ensure the audio file is valid and ffmpeg is installed/available."
+            ) from exc
 
     text_parts: list[str] = []
-    for segment in segments:
+    for segment in segments_list:
         segment_text = (segment.text or "").strip()
         if segment_text:
             text_parts.append(segment_text)
 
-    return " ".join(text_parts).strip()
+    raw_text = " ".join(text_parts).strip()
+    return _postprocess_french_banking_text(raw_text)
