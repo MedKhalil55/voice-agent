@@ -17,15 +17,17 @@ import argparse
 import json
 import os
 import re
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
-from time import sleep, strftime
+from time import perf_counter, sleep, strftime
+from threading import Thread
 
 from dotenv import load_dotenv
 
 from audio import play_wav, record_audio
-from llm import generate_ai_response
-from stt import transcribe_audio
+from llm import generate_ai_response, warmup_llm
+from stt import transcribe_audio, warmup_stt
 from tts import synthesize_speech
 
 
@@ -39,6 +41,37 @@ OUTBOUND_GREETING = (
 
 def _log(message: str) -> None:
     print(f"[{strftime('%H:%M:%S')}] {message}")
+
+
+def _wav_rms_normalized(path: Path) -> float:
+    """Compute RMS of a PCM16 WAV as a normalized float in [0, 1].
+
+    Used to skip STT for silent/empty turns (avoids spending ~5s decoding silence).
+    """
+
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        return 1.0
+
+    with wave.open(str(path), "rb") as wav_file:
+        frames = wav_file.getnframes()
+        channels = wav_file.getnchannels()
+        sampwidth = wav_file.getsampwidth()
+
+        if frames <= 0 or sampwidth != 2:
+            return 0.0
+
+        raw = wav_file.readframes(frames)
+        pcm = np.frombuffer(raw, dtype=np.int16)
+        if pcm.size == 0:
+            return 0.0
+
+        if channels > 1:
+            pcm = pcm.reshape(-1, channels)[:, 0]
+
+        audio = pcm.astype(np.float32) / 32768.0
+        return float(np.sqrt(np.mean(np.square(audio))))
 
 
 def clean_for_tts(text: str) -> str:
@@ -123,6 +156,33 @@ def main() -> None:
     load_dotenv(override=True)
 
     args = _parse_args()
+
+    # Warm up heavy models in the background to reduce first-turn latency.
+    # This runs while the greeting is being synthesized/played.
+    warmup_enabled = os.environ.get(
+        "VOICE_AGENT_WARMUP", "true"
+    ).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if warmup_enabled and not args.demo:
+
+        def _warmup_stt_safe() -> None:
+            try:
+                warmup_stt()
+            except Exception as exc:
+                _log(f"Warmup STT skipped: {exc}")
+
+        def _warmup_llm_safe() -> None:
+            try:
+                warmup_llm()
+            except Exception as exc:
+                _log(f"Warmup LLM skipped: {exc}")
+
+        Thread(target=_warmup_stt_safe, daemon=True).start()
+        Thread(target=_warmup_llm_safe, daemon=True).start()
 
     # Debug visibility: confirm which Piper voice paths are active.
     piper_model = os.environ.get("VOICE_AGENT_PIPER_MODEL", "").strip()
@@ -245,12 +305,50 @@ def main() -> None:
                     _log(f"(DEMO) User text: {user_text!r}")
                 else:
                     _log("Step 1/5: recording microphone audio...")
+                    t0 = perf_counter()
                     record_audio(str(recorded_wav), duration=duration_s)
+                    t1 = perf_counter()
                     _log(f"Recorded: {recorded_wav}")
+                    _log(f"Timing: record_audio took {(t1 - t0):.2f}s")
 
                     _log("Step 2/5: transcribing audio...")
-                    user_text = transcribe_audio(str(recorded_wav))
-                    _log(f"User text: {user_text!r}")
+                    skip_silence = os.environ.get(
+                        "VOICE_AGENT_SKIP_STT_ON_SILENCE", "true"
+                    ).strip().lower() not in {"0", "false", "no", "off"}
+                    try:
+                        rms_threshold = float(
+                            os.environ.get(
+                                "VOICE_AGENT_SKIP_STT_RMS_THRESHOLD", "0.003"
+                            )
+                        )
+                    except ValueError:
+                        rms_threshold = 0.003
+
+                    if skip_silence:
+                        try:
+                            rms = _wav_rms_normalized(recorded_wav)
+                        except Exception:
+                            rms = 1.0
+
+                        if rms <= rms_threshold:
+                            user_text = ""
+                            _log(
+                                f"STT skipped (near-silence): rms={rms:.4f} <= {rms_threshold:.4f}"
+                            )
+                            _log("User text: ''")
+                            _log("Timing: transcribe_audio took 0.00s")
+                        else:
+                            t2 = perf_counter()
+                            user_text = transcribe_audio(str(recorded_wav))
+                            t3 = perf_counter()
+                            _log(f"User text: {user_text!r}")
+                            _log(f"Timing: transcribe_audio took {(t3 - t2):.2f}s")
+                    else:
+                        t2 = perf_counter()
+                        user_text = transcribe_audio(str(recorded_wav))
+                        t3 = perf_counter()
+                        _log(f"User text: {user_text!r}")
+                        _log(f"Timing: transcribe_audio took {(t3 - t2):.2f}s")
 
                 normalized = " ".join((user_text or "").lower().split())
                 if normalized in bye_keywords or any(
@@ -281,15 +379,29 @@ def main() -> None:
                     continue
 
                 _log("Step 3/5: generating AI response...")
+                t4 = perf_counter()
                 response_text = generate_ai_response(user_text)
+                t5 = perf_counter()
                 _log(f"Assistant text: {response_text!r}")
+                _log(f"Timing: generate_ai_response took {(t5 - t4):.2f}s")
 
                 _log("Step 4/5: synthesizing speech...")
+                t6 = perf_counter()
                 synthesize_speech(clean_for_tts(response_text), str(tts_wav))
+                t7 = perf_counter()
                 _log(f"Synthesized: {tts_wav}")
+                _log(f"Timing: synthesize_speech took {(t7 - t6):.2f}s")
 
                 _log("Step 5/5: playing audio...")
+                t8 = perf_counter()
                 play_wav(str(tts_wav))
+                t9 = perf_counter()
+                _log(f"Timing: play_wav took {(t9 - t8):.2f}s")
+
+                if not args.demo:
+                    _log(
+                        f"Timing: end-to-end (post-record) took {(t9 - t1):.2f}s (STT+LLM+TTS+play)"
+                    )
 
                 session_summary["turns"].append(
                     {

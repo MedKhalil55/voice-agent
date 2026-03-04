@@ -30,6 +30,51 @@ from functools import lru_cache
 from pathlib import Path
 
 
+def _parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _load_wav_16k_mono_float32(audio_path: Path):
+    """Load a PCM16 WAV (16 kHz) into a mono float32 NumPy array.
+
+    If the file isn't PCM16/16kHz, return None and let the caller fall back to
+    passing the path to faster-whisper (ffmpeg decode).
+    """
+
+    try:
+        import numpy as np  # type: ignore
+        import wave
+    except Exception:
+        return None
+
+    try:
+        with wave.open(str(audio_path), "rb") as wav_file:
+            framerate = int(wav_file.getframerate())
+            channels = int(wav_file.getnchannels())
+            sampwidth = int(wav_file.getsampwidth())
+            frames = int(wav_file.getnframes())
+
+            if framerate != 16_000 or sampwidth != 2 or frames <= 0:
+                return None
+
+            raw = wav_file.readframes(frames)
+    except Exception:
+        return None
+
+    pcm = np.frombuffer(raw, dtype=np.int16)
+    if pcm.size == 0:
+        return None
+
+    if channels > 1:
+        pcm = pcm.reshape(-1, channels)[:, 0]
+
+    audio = pcm.astype(np.float32) / 32768.0
+    return audio
+
+
 # Runtime override used to force CPU after a CUDA failure (e.g., missing DLLs).
 _RUNTIME_FORCE_DEVICE: str | None = None
 
@@ -300,8 +345,8 @@ def transcribe_audio(file_path: str) -> str:
     #   especially on short banking utterances (names, amounts, payment terms).
     # - temperature=0.0 encourages deterministic decoding, which is desirable
     #   for production voice pipelines.
-    beam_size = _parse_int_env("VOICE_AGENT_WHISPER_BEAM_SIZE", 5)
-    best_of = _parse_int_env("VOICE_AGENT_WHISPER_BEST_OF", 5)
+    beam_size = _parse_int_env("VOICE_AGENT_WHISPER_BEAM_SIZE", 3)
+    best_of = _parse_int_env("VOICE_AGENT_WHISPER_BEST_OF", 1)
     temperature = _parse_float_env("VOICE_AGENT_WHISPER_TEMPERATURE", 0.0)
 
     condition_on_previous_text = _env(
@@ -313,16 +358,28 @@ def transcribe_audio(file_path: str) -> str:
     language = None if lang_raw.lower() in {"", "auto", "none"} else lang_raw
     task = _env("VOICE_AGENT_WHISPER_TASK", "transcribe").strip() or "transcribe"
 
+    # Performance toggles (env-configurable).
+    vad_filter = _parse_bool_env("VOICE_AGENT_WHISPER_VAD_FILTER", True)
+    without_timestamps = _parse_bool_env("VOICE_AGENT_WHISPER_WITHOUT_TIMESTAMPS", True)
+    use_numpy_wav = _parse_bool_env("VOICE_AGENT_STT_USE_NUMPY_WAV", True)
+
+    audio_input = str(audio_path)
+    if use_numpy_wav and audio_path.suffix.lower() == ".wav":
+        in_mem = _load_wav_16k_mono_float32(audio_path)
+        if in_mem is not None:
+            audio_input = in_mem
+
     def _transcribe_once(active_model):
         segments, _info = active_model.transcribe(
-            str(audio_path),
+            audio_input,
             beam_size=beam_size,
             best_of=best_of,
             temperature=temperature,
             condition_on_previous_text=condition_on_previous_text,
-            vad_filter=True,
+            vad_filter=vad_filter,
             language=language,
             task=task,
+            without_timestamps=without_timestamps,
         )
         # Important: `segments` is a lazy generator. Runtime CUDA/DLL errors can
         # occur during iteration, so force evaluation inside the try/except.
@@ -370,3 +427,16 @@ def transcribe_audio(file_path: str) -> str:
 
     raw_text = " ".join(text_parts).strip()
     return _postprocess_french_banking_text(raw_text)
+
+
+def warmup_stt() -> None:
+    """Warm up the STT model.
+
+    Purpose:
+    - Reduce first-turn latency by forcing model initialization early.
+    - Useful to run in a background thread while TTS greeting plays.
+
+    This does not run a transcription; it only loads the model into memory.
+    """
+
+    _get_model()

@@ -83,6 +83,57 @@ By default, recording can stop automatically when you stop speaking (silence) in
 - If it stops too early: lower `VOICE_AGENT_SILENCE_RMS_THRESHOLD` (e.g., `0.005`)
 - If it never stops: increase `VOICE_AGENT_SILENCE_RMS_THRESHOLD` (e.g., `0.02`)
 
+## Latency tuning (phone-call UX)
+
+If your "temps de réponse" feels too slow, the total latency is usually the sum of:
+
+- Stop-on-silence delay (often up to 1–3s)
+- STT decode time (Whisper)
+- LLM generation time (Ollama)
+- TTS synthesis time (Piper)
+
+Recommended knobs (keep quality good, reduce latency):
+
+1) Recording
+
+- Lower silence stop time (faster turn-taking):
+	- `VOICE_AGENT_RECORD_STOP_ON_SILENCE_SECONDS=1.2`
+
+- Trim the trailing silence kept for stop detection (reduces STT time):
+	- `VOICE_AGENT_TRIM_TRAILING_SILENCE=true`
+	- `VOICE_AGENT_TRAILING_SILENCE_PADDING_SECONDS=0.25`
+
+2) STT (Whisper)
+
+- Keep `VOICE_AGENT_WHISPER_MODEL=medium` for quality.
+- For faster decoding with still-good quality:
+	- `VOICE_AGENT_WHISPER_BEAM_SIZE=3`
+	- `VOICE_AGENT_WHISPER_BEST_OF=1`
+
+- Skip STT on near-silent audio (avoids wasting seconds on empty turns):
+	- `VOICE_AGENT_SKIP_STT_ON_SILENCE=true`
+	- `VOICE_AGENT_SKIP_STT_RMS_THRESHOLD=0.003`
+
+- Optional faster-whisper performance toggles:
+	- `VOICE_AGENT_WHISPER_WITHOUT_TIMESTAMPS=true`
+	- `VOICE_AGENT_WHISPER_VAD_FILTER=true`
+	- `VOICE_AGENT_STT_USE_NUMPY_WAV=true`
+
+3) LLM (Ollama)
+
+- Cap output tokens to force shorter answers (faster + less audio playback):
+	- `VOICE_AGENT_OLLAMA_NUM_PREDICT=120` (try 96 if you want even shorter)
+- Reduce context window if you don't need long history (can help speed/memory):
+	- `VOICE_AGENT_OLLAMA_NUM_CTX=2048`
+- Keep the model resident longer:
+	- `VOICE_AGENT_OLLAMA_KEEP_ALIVE=10m`
+
+4) Warmup (reduces first-turn latency)
+
+- By default the app warms up STT/LLM in a background thread while the greeting is playing.
+- Disable if needed:
+	- `VOICE_AGENT_WARMUP=false`
+
 ## Quick TTS smoke test
 
 This explicitly loads `.env` and synthesizes a WAV:

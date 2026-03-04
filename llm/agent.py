@@ -64,24 +64,32 @@ def _build_system_prompt() -> str:
     """
 
     return (
-        "Vous êtes un assistant vocal bancaire, exécuté localement sur l’ordinateur de l’utilisateur.\n"
-        "Contexte : appel de recouvrement et accompagnement à la négociation de solutions de paiement pour des clients en France.\n"
-        "Objectif : comprendre la situation, proposer des options réalistes comme un échelonnement, un report ou un paiement partiel, et guider vers les prochaines étapes sûres.\n\n"
-        "Langue : répondez toujours en français.\n\n"
-        "Règles de style pour une sortie vocale naturelle :\n"
-        "Vous devez parler comme lors d’un appel, avec des phrases simples et naturelles.\n"
-        "Interdictions de formatage : n’utilisez aucun Markdown et aucun format structuré.\n"
-        "Cela signifie notamment : pas de puces, pas de listes, pas de listes numérotées, pas de titres, et pas de symboles de mise en forme comme **, *, _, #, >, ou des séparateurs décoratifs.\n"
-        "Si vous devez donner plusieurs étapes, exprimez-les comme des phrases qui s’enchaînent, avec des connecteurs comme « d’abord », « ensuite », « puis », « enfin ».\n"
-        "Soyez concis, avec une à cinq phrases courtes. Posez au maximum une question de clarification si nécessaire.\n"
-        "Ton : professionnel, calme, empathique, et orienté solution. Évitez les corrections abruptes ; reformulez avec tact.\n\n"
-        "Règles de sécurité bancaire (obligatoires) :\n"
-        "- Ne demandez jamais et ne répétez jamais : mot de passe, code PIN, CVV, numéro de carte complet, ou code à usage unique (OTP).\n"
-        "- Si une authentification est nécessaire, orientez vers l’application/le site officiel de la banque ou le support officiel.\n"
-        "- Pour toute action à risque (ex. opposition carte, contestation), donnez des conseils prudents et recommandez de confirmer via les canaux officiels.\n\n"
-        "Cadre :\n"
-        "- Si vous n’êtes pas certain, dites-le brièvement et indiquez quelle information non sensible est nécessaire.\n"
+        "Vous êtes un assistant vocal bancaire (appel). Répondez toujours en français.\n"
+        "Objectif : comprendre le besoin du client et proposer une solution simple (échelonnement, report, paiement partiel) avec des prochaines étapes sûres.\n"
+        "Style : 1 à 2 phrases courtes, ton professionnel et empathique. Une seule question maximum si nécessaire.\n"
+        "Format : un seul paragraphe, sans sauts de ligne. Aucun Markdown, aucune liste, aucune puce.\n"
+        "Sécurité : ne demandez jamais et ne répétez jamais mot de passe, code PIN, CVV, numéro de carte complet ou OTP. Si authentification : orienter vers l’application/le site officiel.\n"
     )
+
+
+def _parse_optional_int_env(name: str) -> int | None:
+    raw = _env(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(float(raw))
+    except ValueError:
+        return None
+
+
+def _parse_optional_float_env(name: str) -> float | None:
+    raw = _env(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 
 class ConversationState(str, Enum):
@@ -324,11 +332,62 @@ def _get_chat_model():
     # For voice assistants, consistency matters more than creative variation.
     model_name = _env("VOICE_AGENT_OLLAMA_MODEL", "llama3.2")
     base_url = _env("VOICE_AGENT_OLLAMA_BASE_URL", "http://localhost:11434")
+    keep_alive = _env("VOICE_AGENT_OLLAMA_KEEP_ALIVE", "10m").strip() or None
+
+    # Latency/UX controls (optional):
+    # - num_predict: caps output tokens -> faster + shorter spoken responses.
+    # - num_ctx: context window; smaller can be faster and uses less memory.
+    # - num_gpu/num_thread: advanced knobs; leave unset unless you know why.
+    num_predict = _parse_optional_int_env("VOICE_AGENT_OLLAMA_NUM_PREDICT")
+    num_ctx = _parse_optional_int_env("VOICE_AGENT_OLLAMA_NUM_CTX")
+    num_gpu = _parse_optional_int_env("VOICE_AGENT_OLLAMA_NUM_GPU")
+    num_thread = _parse_optional_int_env("VOICE_AGENT_OLLAMA_NUM_THREAD")
+    temperature = _parse_optional_float_env("VOICE_AGENT_OLLAMA_TEMPERATURE")
+
+    # Good default for phone-like UX if not overridden.
+    if num_predict is None:
+        num_predict = 160
+    if temperature is None:
+        temperature = 0.2
+
     return chat_ollama(
         model=model_name,
         base_url=base_url,
-        temperature=0.2,
+        temperature=temperature,
+        num_predict=num_predict,
+        num_ctx=num_ctx,
+        num_gpu=num_gpu,
+        num_thread=num_thread,
+        keep_alive=keep_alive,
     )
+
+
+def warmup_llm() -> None:
+    """Warm up the local LLM (Ollama).
+
+    We keep it light by default: initialize the LangChain client.
+    Optionally, you can force a tiny generation request via env var.
+    """
+
+    chat = _get_chat_model()
+
+    do_request = _env("VOICE_AGENT_LLM_WARMUP_REQUEST", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not do_request:
+        return
+
+    # Tiny request to ensure the Ollama model is resident.
+    try:
+        from langchain_core.messages import HumanMessage  # type: ignore
+
+        chat.invoke([HumanMessage(content="OK")])
+    except Exception:
+        # Warmup must never crash the app.
+        return
 
 
 def generate_ai_response(user_text: str) -> str:

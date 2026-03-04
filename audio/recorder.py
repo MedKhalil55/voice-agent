@@ -267,6 +267,55 @@ def _record_until_silence(
     print(f"[recorder] stopped ({stop_reason}) after {recorded_s:.1f}s")
 
     recording = np.concatenate(chunks, axis=0)
+
+    # Optional latency optimization: trim trailing silence from the recorded
+    # waveform before writing the WAV file.
+    #
+    # Why it helps:
+    # - stop-on-silence records N seconds of silence at the end to decide when
+    #   to stop; that trailing silence is not useful for STT and costs time.
+    # - Trimming it reduces STT runtime roughly proportional to removed seconds.
+    trim_enabled = (
+        _env("VOICE_AGENT_TRIM_TRAILING_SILENCE") or "true"
+    ).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if trim_enabled and recording.size:
+        try:
+            pad_s = float(
+                _env("VOICE_AGENT_TRAILING_SILENCE_PADDING_SECONDS") or "0.25"
+            )
+        except ValueError:
+            pad_s = 0.25
+
+        pad_samples = int(max(0.0, pad_s) * SAMPLE_RATE_HZ)
+
+        # Work with mono float32 array of shape (samples,).
+        mono = recording[:, 0] if recording.ndim == 2 else recording
+        mono = np.asarray(mono, dtype=np.float32)
+
+        # Compute RMS per block and find the last "non-silent" block.
+        # This is robust to occasional quiet samples.
+        block = int(blocksize)
+        if block > 0 and mono.shape[0] >= block:
+            n_blocks = mono.shape[0] // block
+            view = mono[: n_blocks * block].reshape(n_blocks, block)
+            rms = np.sqrt(np.mean(np.square(view), axis=1))
+
+            non_silent = np.where(rms >= float(silence_rms))[0]
+            if non_silent.size:
+                last_block = int(non_silent[-1])
+                cut = (last_block + 1) * block + pad_samples
+                cut = int(min(max(cut, min_samples_needed), mono.shape[0]))
+
+                if recording.ndim == 2:
+                    recording = recording[:cut, :]
+                else:
+                    recording = recording[:cut]
+
     pcm = np.clip(recording, -1.0, 1.0)
     pcm_int16 = (pcm * 32767.0).astype(np.int16)
 
