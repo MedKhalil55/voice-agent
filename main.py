@@ -1,37 +1,39 @@
-"""Local AI voice assistant orchestrator.
+"""Local AI voice assistant (streaming STT).
 
-Flow
-----
-1) Record audio (microphone)
-2) Transcribe audio (faster-whisper)
-3) Generate response (LangChain + Ollama)
-4) Synthesize speech (Piper)
-5) Play audio (speaker)
+This is the refactored entrypoint that uses `StreamingWhisper` instead of the
+old synchronous pipeline (record → write WAV → transcribe).
 
-All components run locally.
+High-level flow (production-style)
+---------------------------------
+1) Start a single `StreamingWhisper` instance at startup.
+2) `on_final` events: trigger one LLM+TTS response at a time.
+4) While TTS is speaking, pause STT to avoid echo / feedback loops.
+
+Design constraints
+------------------
+- No temporary WAV files for user audio.
+- Main thread must remain responsive (callbacks must stay lightweight).
+- Prevent double-processing with a lock.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
-import wave
 from datetime import datetime, timezone
 from pathlib import Path
-from time import perf_counter, sleep, strftime
-from threading import Thread
+from threading import Event, Lock, Thread
+from time import strftime
 
 from dotenv import load_dotenv
 
-from audio import play_wav, record_audio
+from audio import play_wav
 from llm import generate_ai_response, warmup_llm
-from stt import transcribe_audio, warmup_stt
+from stt import StreamingWhisper, warmup_stt
+from stt.streaming_whisper import VadConfig
 from tts import synthesize_speech
 
-
-DEFAULT_RECORD_DURATION_S = 5
 
 OUTBOUND_GREETING = (
     "Bonjour, je suis l’assistant bancaire automatique et je vous appelle au sujet de votre compte. "
@@ -41,37 +43,6 @@ OUTBOUND_GREETING = (
 
 def _log(message: str) -> None:
     print(f"[{strftime('%H:%M:%S')}] {message}")
-
-
-def _wav_rms_normalized(path: Path) -> float:
-    """Compute RMS of a PCM16 WAV as a normalized float in [0, 1].
-
-    Used to skip STT for silent/empty turns (avoids spending ~5s decoding silence).
-    """
-
-    try:
-        import numpy as np  # type: ignore
-    except Exception:
-        return 1.0
-
-    with wave.open(str(path), "rb") as wav_file:
-        frames = wav_file.getnframes()
-        channels = wav_file.getnchannels()
-        sampwidth = wav_file.getsampwidth()
-
-        if frames <= 0 or sampwidth != 2:
-            return 0.0
-
-        raw = wav_file.readframes(frames)
-        pcm = np.frombuffer(raw, dtype=np.int16)
-        if pcm.size == 0:
-            return 0.0
-
-        if channels > 1:
-            pcm = pcm.reshape(-1, channels)[:, 0]
-
-        audio = pcm.astype(np.float32) / 32768.0
-        return float(np.sqrt(np.mean(np.square(audio))))
 
 
 def clean_for_tts(text: str) -> str:
@@ -118,10 +89,6 @@ def clean_for_tts(text: str) -> str:
     return value
 
 
-def _utc_timestamp_for_filename() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-
-
 def _write_conversation_summary(out_dir: Path, summary: dict) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     # Append one JSON object per line (JSONL). This keeps a full history of runs
@@ -133,311 +100,262 @@ def _write_conversation_summary(out_dir: Path, summary: dict) -> Path:
     return out_path
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Local voice agent")
-    parser.add_argument(
-        "--demo",
-        action="store_true",
-        help="Run a deterministic demo conversation (no microphone/STT).",
-    )
-    parser.add_argument(
-        "--duration",
-        type=int,
-        default=DEFAULT_RECORD_DURATION_S,
-        help="Microphone recording duration per turn (seconds). If stop-on-silence is enabled, this is the MAX duration.",
-    )
-    return parser.parse_args()
+def _parse_input_device_from_env() -> int | str | None:
+    """Parse VOICE_AGENT_AUDIO_INPUT_DEVICE (index or exact device name)."""
+
+    raw = os.environ.get("VOICE_AGENT_AUDIO_INPUT_DEVICE", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+def _parse_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+class VoiceAgent:
+    """Voice agent that continuously listens and responds.
+
+    Concurrency model
+    -----------------
+    - Microphone capture runs in PortAudio's callback thread.
+    - STT decoding runs in `StreamingWhisper`'s worker thread.
+    - LLM+TTS runs in a dedicated response thread spawned per final transcript.
+
+    We keep callbacks lightweight and use a `Lock` to prevent overlapping
+    responses and double-processing.
+    """
+
+    def __init__(self) -> None:
+        # On Windows/PowerShell, environment variables may already be set in the
+        # session. We want `.env` to take precedence.
+        load_dotenv(override=True)
+
+        self._shutdown_event = Event()
+        self._processing_lock = Lock()
+
+        # Keep artifacts local and easy to inspect.
+        self._out_dir = Path("artifacts")
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        self._tts_wav = self._out_dir / "assistant.wav"
+
+        self._session_summary: dict = {
+            "started_at_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "streaming_mic",
+            "turns": [],
+            "ended_reason": None,
+        }
+
+        self._bye_keywords = {
+            "au revoir",
+            "aurevoir",
+            # Common ASR confusions for "au revoir" in call audio.
+            "on va voir",
+            "on va voir maintenant",
+            "bonne journée",
+            "a bientôt",
+            "a bientot",
+            "à plus tard",
+            "a plus tard",
+            "merci, au revoir",
+            "terminer",
+            "quitter",
+            "arrêter",
+            "arreter",
+        }
+
+        self._last_final_text = ""
+        input_device = _parse_input_device_from_env()
+
+        # Streaming knobs (tuned for phone-call UX).
+        chunk_seconds = _parse_float_env("VOICE_AGENT_STREAM_CHUNK_SECONDS", 0.25)
+        end_silence_seconds = _parse_float_env(
+            "VOICE_AGENT_STREAM_END_SILENCE_SECONDS", 0.6
+        )
+        self._stt = StreamingWhisper(
+            model_size=os.environ.get("VOICE_AGENT_WHISPER_MODEL", "small") or "small",
+            language=os.environ.get("VOICE_AGENT_WHISPER_LANGUAGE", "fr") or "fr",
+            chunk_seconds=max(0.05, chunk_seconds),
+            vad=VadConfig(silence_seconds_to_end=max(0.05, end_silence_seconds)),
+            on_final=self.handle_final,
+            input_device=input_device,
+        )
+
+    def start(self) -> None:
+        """Start STT streaming and greet the user."""
+
+        # Warm up heavy models (optional). Runs in background.
+        warmup_enabled = os.environ.get(
+            "VOICE_AGENT_WARMUP", "true"
+        ).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        if warmup_enabled:
+
+            def _warmup_stt_safe() -> None:
+                try:
+                    warmup_stt()
+                except Exception as exc:
+                    _log(f"Warmup STT skipped: {exc}")
+
+            def _warmup_llm_safe() -> None:
+                try:
+                    warmup_llm()
+                except Exception as exc:
+                    _log(f"Warmup LLM skipped: {exc}")
+
+            Thread(target=_warmup_stt_safe, daemon=True).start()
+            Thread(target=_warmup_llm_safe, daemon=True).start()
+
+        # Start microphone streaming once.
+        self._stt.start_stream()
+
+        # Pause during greeting playback to avoid STT hearing the assistant.
+        self._stt.pause()
+        try:
+            self.speak(OUTBOUND_GREETING)
+            self._session_summary["turns"].append(
+                {
+                    "user_text": None,
+                    "assistant_text": OUTBOUND_GREETING,
+                    "event": "greeting",
+                }
+            )
+        finally:
+            self._stt.resume()
+
+        _log("Assistant prêt. Parlez, puis faites une courte pause.")
+
+    def handle_partial(self, text: str) -> None:
+        """Partial transcripts: log/UI only (never call LLM here)."""
+
+        cleaned = (text or "").strip()
+        if cleaned:
+            _log(f"Partial: {cleaned}")
+
+    def handle_final(self, text: str) -> None:
+        """Final transcript: trigger LLM response (one at a time)."""
+
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return
+
+        normalized = " ".join(cleaned.lower().split())
+        if not normalized:
+            return
+
+        # Avoid occasional duplicate finals caused by partial-window re-decodes.
+        if normalized == self._last_final_text:
+            return
+        self._last_final_text = normalized
+
+        # Exit intent (optional) for operator convenience.
+        if normalized in self._bye_keywords or any(
+            k in normalized for k in self._bye_keywords
+        ):
+            _log("Detected exit keyword. Shutting down...")
+            Thread(target=self.shutdown, daemon=True).start()
+            return
+
+        # Prevent overlapping responses.
+        if not self._processing_lock.acquire(blocking=False):
+            _log("Ignoring final transcript (assistant is busy).")
+            return
+
+        Thread(target=self._respond_worker, args=(cleaned,), daemon=True).start()
+
+    def _respond_worker(self, user_text: str) -> None:
+        """Background worker: LLM → TTS → playback.
+
+        Runs outside the STT worker thread so streaming remains responsive.
+        """
+
+        try:
+            _log(f"User: {user_text!r}")
+            self._session_summary["turns"].append({"user_text": user_text})
+
+            assistant_text = self.generate_response(user_text)
+            _log(f"Assistant: {assistant_text!r}")
+
+            # Pause STT while speaking to avoid echo.
+            self._stt.pause()
+            try:
+                self.speak(assistant_text)
+            finally:
+                self._stt.resume()
+
+            # Persist conversation turn.
+            self._session_summary["turns"][-1]["assistant_text"] = assistant_text
+
+        except Exception as exc:
+            _log(f"Error in response worker: {exc}")
+        finally:
+            try:
+                self._processing_lock.release()
+            except RuntimeError:
+                pass
+
+    def generate_response(self, user_text: str) -> str:
+        """LLM boundary (kept as a method for easy future tool/RAG integration)."""
+
+        return generate_ai_response(user_text)
+
+    def speak(self, text: str) -> None:
+        """TTS boundary (kept as a method to allow swapping TTS engines)."""
+
+        synthesize_speech(clean_for_tts(text), str(self._tts_wav))
+        play_wav(str(self._tts_wav))
+
+    def shutdown(self) -> None:
+        """Stop streaming and write a session summary."""
+
+        if self._shutdown_event.is_set():
+            return
+
+        self._shutdown_event.set()
+        try:
+            self._stt.stop_stream()
+        except Exception:
+            pass
+
+        self._session_summary["ended_at_utc"] = datetime.now(timezone.utc).isoformat()
+        if self._session_summary.get("ended_reason") is None:
+            self._session_summary["ended_reason"] = "shutdown"
+
+        try:
+            summary_path = _write_conversation_summary(
+                self._out_dir, self._session_summary
+            )
+            _log(f"Conversation summary saved: {summary_path}")
+        except Exception as exc:
+            _log(f"Failed to write conversation summary: {exc}")
 
 
 def main() -> None:
-    # Important on Windows/PowerShell: environment variables may already be set
-    # in the shell/session. We want the project's `.env` to take precedence so
-    # switching voices (e.g., EN -> FR) actually applies.
-    load_dotenv(override=True)
-
-    args = _parse_args()
-
-    # Warm up heavy models in the background to reduce first-turn latency.
-    # This runs while the greeting is being synthesized/played.
-    warmup_enabled = os.environ.get(
-        "VOICE_AGENT_WARMUP", "true"
-    ).strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
-    if warmup_enabled and not args.demo:
-
-        def _warmup_stt_safe() -> None:
-            try:
-                warmup_stt()
-            except Exception as exc:
-                _log(f"Warmup STT skipped: {exc}")
-
-        def _warmup_llm_safe() -> None:
-            try:
-                warmup_llm()
-            except Exception as exc:
-                _log(f"Warmup LLM skipped: {exc}")
-
-        Thread(target=_warmup_stt_safe, daemon=True).start()
-        Thread(target=_warmup_llm_safe, daemon=True).start()
-
-    # Debug visibility: confirm which Piper voice paths are active.
-    piper_model = os.environ.get("VOICE_AGENT_PIPER_MODEL", "").strip()
-    piper_config = os.environ.get("VOICE_AGENT_PIPER_CONFIG", "").strip()
-    if piper_model:
-        _log(f"TTS voice model: {piper_model}")
-    if piper_config:
-        _log(f"TTS voice config: {piper_config}")
-
-    # Keep artifacts local and easy to inspect.
-    out_dir = Path("artifacts")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    recorded_wav = out_dir / "user.wav"
-    tts_wav = out_dir / "assistant.wav"
-
-    duration_s = max(int(args.duration), 1)
-
-    # If silence-stop recording is enabled, `duration_s` becomes a MAX duration.
-    # With a short max duration (e.g., 5s) you may never reach "3 seconds of
-    # silence" if the user speaks for a couple seconds first. To avoid the
-    # recording always ending at 5s, we automatically bump the max duration.
-    stop_on_silence_raw = os.environ.get(
-        "VOICE_AGENT_RECORD_STOP_ON_SILENCE_SECONDS", ""
-    ).strip()
-    silence_seconds = 0.0
-    if stop_on_silence_raw:
-        try:
-            silence_seconds = max(float(stop_on_silence_raw), 0.0)
-        except ValueError:
-            silence_seconds = 0.0
-
-    if silence_seconds > 0:
-        # In stop-on-silence mode, `--duration` is interpreted as a MAX duration.
-        # If the user didn't override `--duration`, we use a more generous default
-        # to avoid cutting off longer utterances.
-        max_raw = os.environ.get("VOICE_AGENT_RECORD_MAX_SECONDS", "").strip()
-        max_env_s = 0
-        if max_raw:
-            try:
-                max_env_s = int(float(max_raw))
-            except ValueError:
-                max_env_s = 0
-
-        if max_env_s > 0:
-            duration_s = max(max_env_s, 1)
-        elif int(args.duration) == DEFAULT_RECORD_DURATION_S:
-            duration_s = 30
-
-        min_max_duration = int(silence_seconds) + 7  # buffer for speaking time
-        if duration_s < min_max_duration:
-            duration_s = min_max_duration
-
-        _log(
-            f"Recording mode: stop-on-silence ({silence_seconds:.1f}s). Max duration per turn: {duration_s}s"
-        )
-    else:
-        _log(f"Recording mode: fixed window. Duration per turn: {duration_s}s")
-
-    bye_keywords = {
-        "au revoir",
-        "aurevoir",
-        "bonne journée",
-        "à bientôt",
-        "a bientot",
-        "à plus tard",
-        "a plus tard",
-        "merci, au revoir",
-        "terminer",
-        "quitter",
-        "arrêter",
-        "arreter",
-    }
-
-    _log("Assistant prêt. Dites « au revoir » pour terminer.")
-
-    session_summary: dict = {
-        "started_at_utc": datetime.now(timezone.utc).isoformat(),
-        "mode": "demo" if args.demo else "mic",
-        "record_duration_seconds": duration_s,
-        "turns": [],
-        "ended_reason": None,
-    }
-
-    # Outbound-call behavior: the assistant starts the conversation.
-    _log("Greeting: synthesizing speech...")
-    synthesize_speech(clean_for_tts(OUTBOUND_GREETING), str(tts_wav))
-    _log("Greeting: playing audio...")
-    play_wav(str(tts_wav))
-    session_summary["turns"].append(
-        {
-            "user_text": None,
-            "assistant_text": OUTBOUND_GREETING,
-            "exit": False,
-            "event": "greeting",
-        }
-    )
-    # Small buffer so playback tail doesn't immediately leak into the next recording.
-    if not args.demo:
-        sleep(0.25)
-
-    demo_script = [
-        "Bonjour.",
-        "J'ai reçu un rappel de paiement et je ne peux pas régler la totalité ce mois-ci.",
-        "Pouvez-vous me proposer un plan de paiement en plusieurs fois ?",
-        "Pouvez-vous me rappeler la semaine prochaine ?",
-        "au revoir",
-    ]
+    agent = VoiceAgent()
+    agent.start()
 
     try:
+        # Keep main thread alive; all work happens on background threads.
         while True:
-            try:
-                if args.demo:
-                    if not demo_script:
-                        session_summary["ended_reason"] = "demo_complete"
-                        _log("Demo script finished.")
-                        break
-
-                    user_text = demo_script.pop(0)
-                    _log(f"(DEMO) User text: {user_text!r}")
-                else:
-                    _log("Step 1/5: recording microphone audio...")
-                    t0 = perf_counter()
-                    record_audio(str(recorded_wav), duration=duration_s)
-                    t1 = perf_counter()
-                    _log(f"Recorded: {recorded_wav}")
-                    _log(f"Timing: record_audio took {(t1 - t0):.2f}s")
-
-                    _log("Step 2/5: transcribing audio...")
-                    skip_silence = os.environ.get(
-                        "VOICE_AGENT_SKIP_STT_ON_SILENCE", "true"
-                    ).strip().lower() not in {"0", "false", "no", "off"}
-                    try:
-                        rms_threshold = float(
-                            os.environ.get(
-                                "VOICE_AGENT_SKIP_STT_RMS_THRESHOLD", "0.003"
-                            )
-                        )
-                    except ValueError:
-                        rms_threshold = 0.003
-
-                    if skip_silence:
-                        try:
-                            rms = _wav_rms_normalized(recorded_wav)
-                        except Exception:
-                            rms = 1.0
-
-                        if rms <= rms_threshold:
-                            user_text = ""
-                            _log(
-                                f"STT skipped (near-silence): rms={rms:.4f} <= {rms_threshold:.4f}"
-                            )
-                            _log("User text: ''")
-                            _log("Timing: transcribe_audio took 0.00s")
-                        else:
-                            t2 = perf_counter()
-                            user_text = transcribe_audio(str(recorded_wav))
-                            t3 = perf_counter()
-                            _log(f"User text: {user_text!r}")
-                            _log(f"Timing: transcribe_audio took {(t3 - t2):.2f}s")
-                    else:
-                        t2 = perf_counter()
-                        user_text = transcribe_audio(str(recorded_wav))
-                        t3 = perf_counter()
-                        _log(f"User text: {user_text!r}")
-                        _log(f"Timing: transcribe_audio took {(t3 - t2):.2f}s")
-
-                normalized = " ".join((user_text or "").lower().split())
-                if normalized in bye_keywords or any(
-                    k in normalized for k in bye_keywords
-                ):
-                    farewell = (
-                        "Au revoir et merci de votre appel. "
-                        "Si vous avez besoin d'aide, n'hésitez pas à nous recontacter."
-                    )
-                    _log("Detected exit keyword. Closing conversation...")
-                    _log("Step 4/5: synthesizing speech...")
-                    synthesize_speech(clean_for_tts(farewell), str(tts_wav))
-                    _log("Step 5/5: playing audio...")
-                    play_wav(str(tts_wav))
-
-                    session_summary["turns"].append(
-                        {
-                            "user_text": user_text,
-                            "assistant_text": farewell,
-                            "exit": True,
-                        }
-                    )
-                    session_summary["ended_reason"] = "user_said_bye"
-                    break
-
-                if not normalized:
-                    _log("No speech detected. Try again.")
-                    continue
-
-                _log("Step 3/5: generating AI response...")
-                t4 = perf_counter()
-                response_text = generate_ai_response(user_text)
-                t5 = perf_counter()
-                _log(f"Assistant text: {response_text!r}")
-                _log(f"Timing: generate_ai_response took {(t5 - t4):.2f}s")
-
-                _log("Step 4/5: synthesizing speech...")
-                t6 = perf_counter()
-                synthesize_speech(clean_for_tts(response_text), str(tts_wav))
-                t7 = perf_counter()
-                _log(f"Synthesized: {tts_wav}")
-                _log(f"Timing: synthesize_speech took {(t7 - t6):.2f}s")
-
-                _log("Step 5/5: playing audio...")
-                t8 = perf_counter()
-                play_wav(str(tts_wav))
-                t9 = perf_counter()
-                _log(f"Timing: play_wav took {(t9 - t8):.2f}s")
-
-                if not args.demo:
-                    _log(
-                        f"Timing: end-to-end (post-record) took {(t9 - t1):.2f}s (STT+LLM+TTS+play)"
-                    )
-
-                session_summary["turns"].append(
-                    {
-                        "user_text": user_text,
-                        "assistant_text": response_text,
-                        "exit": False,
-                    }
-                )
-
-                # Continuous loop: immediately go to the next recording.
-                if not args.demo:
-                    sleep(0.25)
-
-            except Exception as exc:
-                _log(f"Error: {exc}")
-                _log(
-                    "Hints: Ollama must be running; Piper needs VOICE_AGENT_PIPER_MODEL/VOICE_AGENT_PIPER_CONFIG (and/or VOICE_AGENT_PIPER_BIN); "
-                    "ffmpeg may be needed for STT decoding; check mic/speaker devices."
-                )
-                if args.demo:
-                    session_summary["ended_reason"] = "error_in_demo"
-                    break
-
-                # In mic mode, keep running unless the user says an exit intent.
-                sleep(0.5)
-                continue
-
+            if agent._shutdown_event.wait(0.25):
+                break
     except KeyboardInterrupt:
-        session_summary["ended_reason"] = "keyboard_interrupt"
         _log("Interrupted by user")
     finally:
-        session_summary["ended_at_utc"] = datetime.now(timezone.utc).isoformat()
-        if session_summary.get("ended_reason") is None:
-            session_summary["ended_reason"] = "completed"
-        summary_path = _write_conversation_summary(out_dir, session_summary)
-        _log(f"Conversation summary saved: {summary_path}")
+        agent.shutdown()
 
 
 if __name__ == "__main__":

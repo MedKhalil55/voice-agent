@@ -63,6 +63,23 @@ From the project root:
 uv run main.py
 ```
 
+## Streaming transcription (real-time partials)
+
+This project also includes a pseudo-streaming mode that:
+
+- Captures the microphone in 0.5s float32 chunks
+- Keeps audio in memory (no temporary WAV files)
+- Uses lightweight VAD for start/end detection
+- Prints partial transcripts while you speak, then a final transcript
+
+Run:
+
+```
+uv run streaming_demo.py
+```
+
+Tip: if the wrong microphone is used, set `VOICE_AGENT_AUDIO_INPUT_DEVICE` in `.env`.
+
 Outputs are written to the `artifacts/` folder (for example: `artifacts/user.wav` and `artifacts/assistant.wav`).
 
 ## Troubleshooting STT (wrong language / hearing the assistant)
