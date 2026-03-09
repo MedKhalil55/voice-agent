@@ -25,11 +25,44 @@ We intentionally avoid agent tool-use frameworks at this stage.
 from __future__ import annotations
 
 import os
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
 from typing import Deque, List, Tuple
+
+_SENTENCE_END_RE = re.compile(r"[.!?]")
+
+
+def _trim_to_last_sentence(text: str) -> str:
+    """Trim *text* to the last complete sentence.
+
+    When num_predict cuts the LLM output mid-sentence, this drops the
+    trailing fragment so the spoken response always sounds natural.
+    If the text already ends with sentence-ending punctuation, it is
+    returned unchanged.  If no sentence boundary is found at all the
+    full text is returned as-is (better than returning nothing).
+    """
+
+    text = text.strip()
+    if not text:
+        return text
+
+    # Already ends cleanly.
+    if text[-1] in ".!?":
+        return text
+
+    # Find the last sentence-ending punctuation.
+    match = None
+    for match in _SENTENCE_END_RE.finditer(text):
+        pass  # advance to the last match
+
+    if match is not None:
+        return text[: match.end()].strip()
+
+    # No sentence boundary at all — return as-is.
+    return text
 
 
 def _env(name: str, default: str) -> str:
@@ -409,11 +442,13 @@ def generate_ai_response(user_text: str) -> str:
     try:
         response = chat.invoke(messages)
         content = getattr(response, "content", "")
-        assistant_text = (content or "").strip()
+        assistant_text = _trim_to_last_sentence((content or "").strip())
         if not assistant_text:
             assistant_text = "Je suis désolé, je ne parviens pas à formuler une réponse pour le moment."
     except Exception:
-        assistant_text = "Je suis désolé, je ne parviens pas à formuler une réponse pour le moment."
+        assistant_text = (
+            "Je suis désolé, je ne parviens pas à formuler une réponse pour le moment."
+        )
 
     session.append_turn(text, assistant_text)
     return assistant_text
