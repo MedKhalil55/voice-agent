@@ -183,9 +183,7 @@ class StreamingWhisper:
             raise ValueError("chunk_seconds too small for the given sample_rate_hz")
 
         self.rolling_buffer_seconds = float(rolling_buffer_seconds)
-        # Backward-compat: keep these arguments but partial decoding is disabled.
-        _ = float(partial_window_seconds)
-        _ = float(partial_interval_seconds)
+        self.partial_window_seconds = float(partial_window_seconds)
 
         self.vad = vad or VadConfig()
         self.language = language

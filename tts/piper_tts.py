@@ -302,3 +302,156 @@ def _synthesize_with_piper_binary(text: str, output_path: str) -> None:
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or b"").decode("utf-8", errors="replace")
         raise RuntimeError(f"Piper binary failed: {stderr.strip()}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Streaming TTS playback (no intermediate WAV files)
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=1)
+def _get_piper_sample_rate() -> int:
+    """Read and cache the audio sample rate from the Piper voice config JSON."""
+    import json as _json
+
+    config_path = _resolve_path(_env("VOICE_AGENT_PIPER_CONFIG")) or _infer_config_path(
+        _resolve_path(_env("VOICE_AGENT_PIPER_MODEL"))
+    )
+    if config_path and Path(config_path).exists():
+        with open(config_path, "r", encoding="utf-8") as fh:
+            config = _json.load(fh)
+        return int(config.get("audio", {}).get("sample_rate", 22050))
+    return 22050
+
+
+def warmup_tts() -> None:
+    """Pre-validate Piper paths and cache the voice config at startup.
+
+    For the binary path this validates file existence and caches the sample
+    rate.  For the Python piper-tts path it also loads the ONNX model.
+    """
+    _get_piper_sample_rate()
+    if not _env("VOICE_AGENT_PIPER_BIN"):
+        _get_voice()
+
+
+def speak_streaming(text: str) -> None:
+    """Synthesize *text* and play it immediately — no WAV files.
+
+    Audio chunks are streamed to ``sounddevice.OutputStream`` as Piper
+    generates them, so playback starts as soon as the first chunk is ready.
+    """
+    clean_text = (text or "").strip()
+    if not clean_text:
+        return
+
+    if _env("VOICE_AGENT_PIPER_BIN"):
+        _speak_streaming_binary(clean_text)
+    else:
+        _speak_streaming_python(clean_text)
+
+
+def _speak_streaming_binary(text: str) -> None:
+    """Stream TTS via the standalone Piper binary (``--output-raw``).
+
+    Piper writes raw 16-bit signed-LE mono PCM to *stdout*.  We read it in
+    small chunks and feed each one directly to a ``sounddevice.OutputStream``
+    so playback begins while Piper is still synthesising.
+    """
+    import time
+
+    import numpy as np
+    import sounddevice as sd
+
+    piper_bin = _resolve_path(_env("VOICE_AGENT_PIPER_BIN"))
+    if not piper_bin:
+        raise RuntimeError("VOICE_AGENT_PIPER_BIN is not set")
+    model_path = _resolve_path(_env("VOICE_AGENT_PIPER_MODEL"))
+    if not model_path:
+        raise RuntimeError("VOICE_AGENT_PIPER_MODEL is not set")
+
+    config_path = _resolve_path(_env("VOICE_AGENT_PIPER_CONFIG")) or _infer_config_path(
+        model_path
+    )
+    sample_rate = _get_piper_sample_rate()
+
+    espeak_data_dir = _resolve_path(_env("VOICE_AGENT_PIPER_ESPEAK_DATA"))
+    if not espeak_data_dir:
+        maybe = Path(piper_bin).resolve().parent / "espeak-ng-data"
+        if maybe.exists():
+            espeak_data_dir = str(maybe)
+
+    cmd = [piper_bin, "-m", model_path, "--output-raw"]
+    if config_path:
+        cmd.extend(["-c", config_path])
+    if espeak_data_dir:
+        cmd.extend(["--espeak_data", espeak_data_dir])
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    proc.stdin.write((text + "\n").encode("utf-8"))
+    proc.stdin.close()
+
+    # 1024 samples × 2 bytes/sample = 2048 bytes per read.
+    CHUNK_BYTES = 2048
+
+    stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="int16")
+    stream.start()
+    wrote_any = False
+    try:
+        while True:
+            data = proc.stdout.read(CHUNK_BYTES)
+            if not data:
+                break
+            # Guarantee an even byte-count for int16 framing.
+            if len(data) % 2 != 0:
+                data = data[:-1]
+            if not data:
+                continue
+            audio = np.frombuffer(data, dtype=np.int16)
+            stream.write(audio.reshape(-1, 1))
+            wrote_any = True
+        # Let the output ring-buffer drain before closing the stream.
+        if wrote_any:
+            time.sleep(0.2)
+    finally:
+        stream.stop()
+        stream.close()
+
+    rc = proc.wait()
+    if rc != 0 and not wrote_any:
+        stderr_text = (proc.stderr.read() or b"").decode("utf-8", errors="replace")
+        raise RuntimeError(f"Piper binary failed (exit {rc}): {stderr_text.strip()}")
+
+
+def _speak_streaming_python(text: str) -> None:
+    """Stream TTS via the Python ``piper-tts`` package (fallback)."""
+    import time
+
+    import numpy as np
+    import sounddevice as sd
+
+    voice = _get_voice()
+    sample_rate = _get_piper_sample_rate()
+
+    stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="int16")
+    stream.start()
+    wrote_any = False
+    try:
+        for chunk in voice.synthesize(text):
+            audio_bytes = getattr(chunk, "audio_int16_bytes", None) or getattr(
+                chunk, "audio", b""
+            )
+            if audio_bytes:
+                audio = np.frombuffer(audio_bytes, dtype=np.int16)
+                stream.write(audio.reshape(-1, 1))
+                wrote_any = True
+        if wrote_any:
+            time.sleep(0.2)
+    finally:
+        stream.stop()
+        stream.close()

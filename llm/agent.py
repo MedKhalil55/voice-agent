@@ -66,7 +66,8 @@ def _build_system_prompt() -> str:
     return (
         "Vous êtes un assistant vocal bancaire (appel). Répondez toujours en français.\n"
         "Objectif : comprendre le besoin du client et proposer une solution simple (échelonnement, report, paiement partiel) avec des prochaines étapes sûres.\n"
-        "Style : 1 à 2 phrases courtes, ton professionnel et empathique. Une seule question maximum si nécessaire.\n"
+        "Style : maximum 2 phrases courtes (~30 mots au total), ton professionnel et empathique. Une seule question maximum si nécessaire.\n"
+        "Longueur : répondez de manière très concise, comme dans une vraie conversation téléphonique. Pas de longs développements.\n"
         "Format : un seul paragraphe, sans sauts de ligne. Aucun Markdown, aucune liste, aucune puce.\n"
         "Sécurité : ne demandez jamais et ne répétez jamais mot de passe, code PIN, CVV, numéro de carte complet ou OTP. Si authentification : orienter vers l’application/le site officiel.\n"
     )
@@ -346,7 +347,7 @@ def _get_chat_model():
 
     # Good default for phone-like UX if not overridden.
     if num_predict is None:
-        num_predict = 160
+        num_predict = 60
     if temperature is None:
         temperature = 0.2
 
@@ -391,29 +392,9 @@ def warmup_llm() -> None:
 
 
 def generate_ai_response(user_text: str) -> str:
-    """Generate an AI response to the user's text (local LLM via Ollama).
+    """Generate a single LLM response and update conversation state.
 
-    This is intentionally minimal: no tools, no memory, no external APIs.
-
-    Parameters
-    ----------
-    user_text:
-        The user's transcribed utterance.
-
-    Returns
-    -------
-    str
-        Assistant response text.
-
-    Prompt engineering notes
-    ------------------------
-    We separate messages by role:
-    - System message: persistent rules and persona.
-    - Human message: the user's request.
-
-    This separation is important because chat models are trained to treat the
-    system role as higher priority. It reduces prompt injection risk and keeps
-    banking safety constraints applied across turns.
+    This is the main public API for the LLM module.
     """
 
     text = (user_text or "").strip()
@@ -425,15 +406,14 @@ def generate_ai_response(user_text: str) -> str:
     session = _get_session()
     messages = session.build_messages(text)
 
-    # `.invoke()` is the simplest LangChain execution method for a single turn.
-    # It returns an AIMessage-like object with `.content`.
-    response = chat.invoke(messages)
+    try:
+        response = chat.invoke(messages)
+        content = getattr(response, "content", "")
+        assistant_text = (content or "").strip()
+        if not assistant_text:
+            assistant_text = "Je suis désolé, je ne parviens pas à formuler une réponse pour le moment."
+    except Exception:
+        assistant_text = "Je suis désolé, je ne parviens pas à formuler une réponse pour le moment."
 
-    content = getattr(response, "content", "")
-
-    final_text = (
-        (content or "").strip()
-        or "Je suis désolé, je ne parviens pas à formuler une réponse pour le moment."
-    )
-    session.append_turn(text, final_text)
-    return final_text
+    session.append_turn(text, assistant_text)
+    return assistant_text

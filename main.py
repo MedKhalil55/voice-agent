@@ -28,11 +28,10 @@ from time import strftime
 
 from dotenv import load_dotenv
 
-from audio import play_wav
 from llm import generate_ai_response, warmup_llm
 from stt import StreamingWhisper, warmup_stt
 from stt.streaming_whisper import VadConfig
-from tts import synthesize_speech
+from tts import speak_streaming, warmup_tts
 
 
 OUTBOUND_GREETING = (
@@ -146,7 +145,6 @@ class VoiceAgent:
         # Keep artifacts local and easy to inspect.
         self._out_dir = Path("artifacts")
         self._out_dir.mkdir(parents=True, exist_ok=True)
-        self._tts_wav = self._out_dir / "assistant.wav"
 
         self._session_summary: dict = {
             "started_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -186,6 +184,7 @@ class VoiceAgent:
             language=os.environ.get("VOICE_AGENT_WHISPER_LANGUAGE", "fr") or "fr",
             chunk_seconds=max(0.05, chunk_seconds),
             vad=VadConfig(silence_seconds_to_end=max(0.05, end_silence_seconds)),
+            on_partial=self.handle_partial,
             on_final=self.handle_final,
             input_device=input_device,
         )
@@ -216,8 +215,15 @@ class VoiceAgent:
                 except Exception as exc:
                     _log(f"Warmup LLM skipped: {exc}")
 
+            def _warmup_tts_safe() -> None:
+                try:
+                    warmup_tts()
+                except Exception as exc:
+                    _log(f"Warmup TTS skipped: {exc}")
+
             Thread(target=_warmup_stt_safe, daemon=True).start()
             Thread(target=_warmup_llm_safe, daemon=True).start()
+            Thread(target=_warmup_tts_safe, daemon=True).start()
 
         # Start microphone streaming once.
         self._stt.start_stream()
@@ -239,7 +245,7 @@ class VoiceAgent:
         _log("Assistant prêt. Parlez, puis faites une courte pause.")
 
     def handle_partial(self, text: str) -> None:
-        """Partial transcripts: log/UI only (never call LLM here)."""
+        """Partial transcripts: log for debugging."""
 
         cleaned = (text or "").strip()
         if cleaned:
@@ -277,16 +283,13 @@ class VoiceAgent:
         Thread(target=self._respond_worker, args=(cleaned,), daemon=True).start()
 
     def _respond_worker(self, user_text: str) -> None:
-        """Background worker: LLM → TTS → playback.
-
-        Runs outside the STT worker thread so streaming remains responsive.
-        """
+        """Background worker: LLM → TTS → playback."""
 
         try:
             _log(f"User: {user_text!r}")
             self._session_summary["turns"].append({"user_text": user_text})
 
-            assistant_text = self.generate_response(user_text)
+            assistant_text = generate_ai_response(user_text)
             _log(f"Assistant: {assistant_text!r}")
 
             # Pause STT while speaking to avoid echo.
@@ -313,10 +316,9 @@ class VoiceAgent:
         return generate_ai_response(user_text)
 
     def speak(self, text: str) -> None:
-        """TTS boundary (kept as a method to allow swapping TTS engines)."""
+        """TTS boundary: streaming playback with no intermediate WAV files."""
 
-        synthesize_speech(clean_for_tts(text), str(self._tts_wav))
-        play_wav(str(self._tts_wav))
+        speak_streaming(clean_for_tts(text))
 
     def shutdown(self) -> None:
         """Stop streaming and write a session summary."""
