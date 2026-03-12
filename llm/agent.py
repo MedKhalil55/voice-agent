@@ -24,6 +24,7 @@ We intentionally avoid agent tool-use frameworks at this stage.
 
 from __future__ import annotations
 
+import json as _json
 import os
 import re
 from collections import deque
@@ -98,12 +99,9 @@ def _build_system_prompt() -> str:
     """
 
     return (
-        "Vous êtes un assistant vocal bancaire (appel). Répondez toujours en français.\n"
-        "Objectif : comprendre le besoin du client et proposer une solution simple (échelonnement, report, paiement partiel) avec des prochaines étapes sûres.\n"
-        "Style : maximum 2 phrases courtes (~30 mots au total), ton professionnel et empathique. Une seule question maximum si nécessaire.\n"
-        "Longueur : répondez de manière très concise, comme dans une vraie conversation téléphonique. Pas de longs développements.\n"
-        "Format : un seul paragraphe, sans sauts de ligne. Aucun Markdown, aucune liste, aucune puce.\n"
-        "Sécurité : ne demandez jamais et ne répétez jamais mot de passe, code PIN, CVV, numéro de carte complet ou OTP. Si authentification : orienter vers l’application/le site officiel.\n"
+        "Assistant vocal bancaire. Répondez en français en UNE seule phrase courte (15-20 mots max). Ton pro, empathique.\n"
+        "Solutions simples: échelonnement, report, paiement partiel. Pas de Markdown, pas de liste.\n"
+        "INTERDIT: mot de passe, PIN, CVV, numéro carte, OTP.\n"
     )
 
 
@@ -151,41 +149,15 @@ def _parse_int_env(name: str, default: int) -> int:
 
 
 def _state_guidance(state: ConversationState) -> str:
-    """State-specific prompt guidance.
-
-    This is intentionally short and voice-oriented.
-    """
+    """State-specific prompt guidance."""
 
     if state == ConversationState.INTRO:
-        return (
-            "État de l’appel : INTRO.\n"
-            "But : expliquer brièvement l’objet de l’appel et comprendre le besoin principal du client.\n"
-            "Prochaine action : poser une question ciblée pour qualifier la demande (sujet, type de produit, échéance).\n"
-            "Ton : professionnel, calme, concis.\n"
-        )
-
+        return "INTRO: expliquer l'objet de l'appel, poser une question ciblée.\n"
     if state == ConversationState.DISCOVERY:
-        return (
-            "État de l’appel : DISCOVERY.\n"
-            "But : recueillir uniquement les informations minimales et non sensibles pour aider (montant approximatif, date d’échéance, type de produit).\n"
-            "Prochaine action : poser au maximum une question de clarification, puis proposer un plan simple.\n"
-            "Ton : empathique, factuel, orienté solution.\n"
-        )
-
+        return "DISCOVERY: recueillir infos minimales non sensibles, proposer un plan.\n"
     if state == ConversationState.NEGOTIATION:
-        return (
-            "État de l’appel : NEGOTIATION.\n"
-            "But : proposer des options réalistes (paiement fractionné, échéancier, report, paiement partiel) et vérifier les contraintes du client.\n"
-            "Prochaine action : proposer une option claire et demander une confirmation ou un montant de budget (sans jamais demander d’identifiants ni de codes).\n"
-            "Ton : collaboratif, rassurant, orienté accord.\n"
-        )
-
-    return (
-        "État de l’appel : CLOSING.\n"
-        "But : résumer la solution retenue et indiquer la prochaine étape sûre via les canaux officiels.\n"
-        "Prochaine action : vérifier si le client a une autre question, puis conclure brièvement.\n"
-        "Ton : courtois, clair, concis.\n"
-    )
+        return "NEGOTIATION: proposer options réalistes, demander confirmation. Pas d'identifiants.\n"
+    return "CLOSING: résumer la solution, indiquer la prochaine étape officielle.\n"
 
 
 def _infer_next_state(
@@ -302,6 +274,17 @@ class ConversationSession:
         messages.append(HumanMessage(content=user_text))
         return messages
 
+    def build_raw_messages(self, user_text: str) -> list[dict]:
+        """Build messages as plain dicts for direct Ollama API calls."""
+        state_for_prompt = _infer_next_state(self.state, user_text)
+        system = _build_system_prompt() + _state_guidance(state_for_prompt)
+        msgs: list[dict] = [{"role": "system", "content": system}]
+        for u, a in self.turns:
+            msgs.append({"role": "user", "content": u})
+            msgs.append({"role": "assistant", "content": a})
+        msgs.append({"role": "user", "content": user_text})
+        return msgs
+
 
 _SESSION: ConversationSession | None = None
 
@@ -381,7 +364,7 @@ def _get_chat_model():
 
     # Good default for phone-like UX if not overridden.
     if num_predict is None:
-        num_predict = 60
+        num_predict = 35
     if temperature is None:
         temperature = 0.2
 
@@ -425,6 +408,68 @@ def warmup_llm() -> None:
         return
 
 
+# ---------------------------------------------------------------------------
+# Direct Ollama HTTP streaming (bypasses LangChain for lower TTFT)
+# ---------------------------------------------------------------------------
+
+_OLLAMA_HTTP: object | None = None
+
+
+def _get_ollama_http():
+    """Persistent httpx.Client for direct Ollama streaming."""
+    global _OLLAMA_HTTP
+    if _OLLAMA_HTTP is None:
+        import httpx  # transitive dep of langchain-ollama
+
+        _OLLAMA_HTTP = httpx.Client(timeout=httpx.Timeout(60.0, connect=5.0))
+    return _OLLAMA_HTTP
+
+
+def _stream_ollama_tokens(messages_raw: list[dict]):
+    """Stream tokens from Ollama /api/chat, bypassing LangChain overhead."""
+    model = _env("VOICE_AGENT_OLLAMA_MODEL", "llama3.2")
+    base_url = _env("VOICE_AGENT_OLLAMA_BASE_URL", "http://localhost:11434")
+    keep_alive = _env("VOICE_AGENT_OLLAMA_KEEP_ALIVE", "10m").strip() or None
+
+    options: dict = {}
+    for key, env_name, parser in (
+        ("num_predict", "VOICE_AGENT_OLLAMA_NUM_PREDICT", _parse_optional_int_env),
+        ("num_ctx", "VOICE_AGENT_OLLAMA_NUM_CTX", _parse_optional_int_env),
+        ("num_gpu", "VOICE_AGENT_OLLAMA_NUM_GPU", _parse_optional_int_env),
+        ("num_thread", "VOICE_AGENT_OLLAMA_NUM_THREAD", _parse_optional_int_env),
+        ("temperature", "VOICE_AGENT_OLLAMA_TEMPERATURE", _parse_optional_float_env),
+    ):
+        val = parser(env_name)
+        if val is not None:
+            options[key] = val
+    options.setdefault("num_predict", 35)
+    options.setdefault("temperature", 0.2)
+
+    payload: dict = {
+        "model": model,
+        "messages": messages_raw,
+        "stream": True,
+        "options": options,
+    }
+    if keep_alive:
+        payload["keep_alive"] = keep_alive
+
+    url = f"{base_url.rstrip('/')}/api/chat"
+    client = _get_ollama_http()
+
+    with client.stream("POST", url, json=payload) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            data = _json.loads(line)
+            token = data.get("message", {}).get("content", "")
+            if token:
+                yield token
+            if data.get("done", False):
+                break
+
+
 def generate_ai_response(user_text: str) -> str:
     """Generate a single LLM response and update conversation state.
 
@@ -458,8 +503,8 @@ def generate_ai_response(user_text: str) -> str:
 def stream_ai_response_sentences(user_text: str):
     """Stream LLM response, yielding complete sentences as they form.
 
-    Uses ``chat.stream()`` instead of ``chat.invoke()`` so the first sentence
-    can be spoken by TTS while the LLM is still generating the rest.
+    Uses direct Ollama HTTP streaming (bypassing LangChain) for minimal
+    time-to-first-token latency.
     """
 
     text = (user_text or "").strip()
@@ -467,19 +512,15 @@ def stream_ai_response_sentences(user_text: str):
         yield "Je n'ai pas bien compris. En quoi puis-je vous aider ?"
         return
 
-    chat = _get_chat_model()
     session = _get_session()
-    messages = session.build_messages(text)
+    messages = session.build_raw_messages(text)
 
     buffer = ""
     full_response = ""
     _MAX_BUFFER = 200  # Force-yield if no punctuation found
 
     try:
-        for chunk in chat.stream(messages):
-            token = getattr(chunk, "content", "") or ""
-            if not token:
-                continue
+        for token in _stream_ollama_tokens(messages):
             buffer += token
             full_response += token
 

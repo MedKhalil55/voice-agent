@@ -351,6 +351,30 @@ def speak_streaming(text: str) -> None:
         _speak_streaming_python(clean_text)
 
 
+# Persistent audio output stream to avoid per-sentence creation overhead.
+_SHARED_AUDIO_OUT: dict | None = None
+
+
+def _get_or_create_output_stream(sample_rate: int):
+    """Return a persistent sounddevice OutputStream, creating one if needed."""
+    import sounddevice as sd
+
+    global _SHARED_AUDIO_OUT
+    if _SHARED_AUDIO_OUT is not None:
+        s = _SHARED_AUDIO_OUT["stream"]
+        if _SHARED_AUDIO_OUT["rate"] == sample_rate and s.active:
+            return s
+        try:
+            s.stop()
+            s.close()
+        except Exception:
+            pass
+    s = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="int16")
+    s.start()
+    _SHARED_AUDIO_OUT = {"stream": s, "rate": sample_rate}
+    return s
+
+
 def _speak_streaming_binary(text: str) -> None:
     """Stream TTS via the standalone Piper binary (``--output-raw``).
 
@@ -361,7 +385,6 @@ def _speak_streaming_binary(text: str) -> None:
     import time
 
     import numpy as np
-    import sounddevice as sd
 
     piper_bin = _resolve_path(_env("VOICE_AGENT_PIPER_BIN"))
     if not piper_bin:
@@ -399,34 +422,26 @@ def _speak_streaming_binary(text: str) -> None:
     # 1024 samples × 2 bytes/sample = 2048 bytes per read.
     CHUNK_BYTES = 2048
 
-    stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="int16")
-    stream.start()
+    stream = _get_or_create_output_stream(sample_rate)
     wrote_any = False
     tts_start = time.monotonic()
-    try:
-        while True:
-            data = proc.stdout.read(CHUNK_BYTES)
-            if not data:
-                break
-            # Guarantee an even byte-count for int16 framing.
-            if len(data) % 2 != 0:
-                data = data[:-1]
-            if not data:
-                continue
-            audio = np.frombuffer(data, dtype=np.int16)
-            stream.write(audio.reshape(-1, 1))
-            if not wrote_any:
-                from time import strftime
+    while True:
+        data = proc.stdout.read(CHUNK_BYTES)
+        if not data:
+            break
+        # Guarantee an even byte-count for int16 framing.
+        if len(data) % 2 != 0:
+            data = data[:-1]
+        if not data:
+            continue
+        audio = np.frombuffer(data, dtype=np.int16)
+        stream.write(audio.reshape(-1, 1))
+        if not wrote_any:
+            from time import strftime
 
-                tts_latency = time.monotonic() - tts_start
-                print(f"[{strftime('%H:%M:%S')}] TTS latency: {tts_latency:.2f} sec")
-            wrote_any = True
-        # Let the output ring-buffer drain before closing the stream.
-        if wrote_any:
-            time.sleep(0.2)
-    finally:
-        stream.stop()
-        stream.close()
+            tts_latency = time.monotonic() - tts_start
+            print(f"[{strftime('%H:%M:%S')}] TTS latency: {tts_latency:.2f} sec")
+        wrote_any = True
 
     rc = proc.wait()
     if rc != 0 and not wrote_any:
@@ -436,28 +451,16 @@ def _speak_streaming_binary(text: str) -> None:
 
 def _speak_streaming_python(text: str) -> None:
     """Stream TTS via the Python ``piper-tts`` package (fallback)."""
-    import time
-
     import numpy as np
-    import sounddevice as sd
 
     voice = _get_voice()
     sample_rate = _get_piper_sample_rate()
 
-    stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="int16")
-    stream.start()
-    wrote_any = False
-    try:
-        for chunk in voice.synthesize(text):
-            audio_bytes = getattr(chunk, "audio_int16_bytes", None) or getattr(
-                chunk, "audio", b""
-            )
-            if audio_bytes:
-                audio = np.frombuffer(audio_bytes, dtype=np.int16)
-                stream.write(audio.reshape(-1, 1))
-                wrote_any = True
-        if wrote_any:
-            time.sleep(0.2)
-    finally:
-        stream.stop()
-        stream.close()
+    stream = _get_or_create_output_stream(sample_rate)
+    for chunk in voice.synthesize(text):
+        audio_bytes = getattr(chunk, "audio_int16_bytes", None) or getattr(
+            chunk, "audio", b""
+        )
+        if audio_bytes:
+            audio = np.frombuffer(audio_bytes, dtype=np.int16)
+            stream.write(audio.reshape(-1, 1))
