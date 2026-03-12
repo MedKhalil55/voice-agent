@@ -439,6 +439,9 @@ class StreamingWhisper:
         return stt_mod._postprocess_french_banking_text(raw)  # pylint: disable=protected-access
 
     def _emit_final(self) -> None:
+        import time as _time
+        from time import strftime
+
         import numpy as np  # type: ignore
 
         if not self._speech_chunks:
@@ -446,7 +449,12 @@ class StreamingWhisper:
 
         try:
             audio = np.concatenate(self._speech_chunks, axis=0).astype(np.float32)
+            t0 = _time.monotonic()
             text = self._decode(audio)
+            self._last_decode_seconds = _time.monotonic() - t0
+            print(
+                f"[{strftime('%H:%M:%S')}] STT latency: {self._last_decode_seconds:.2f} sec"
+            )
         except Exception:
             return
 

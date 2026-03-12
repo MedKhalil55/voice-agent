@@ -402,6 +402,7 @@ def _speak_streaming_binary(text: str) -> None:
     stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="int16")
     stream.start()
     wrote_any = False
+    tts_start = time.monotonic()
     try:
         while True:
             data = proc.stdout.read(CHUNK_BYTES)
@@ -414,6 +415,11 @@ def _speak_streaming_binary(text: str) -> None:
                 continue
             audio = np.frombuffer(data, dtype=np.int16)
             stream.write(audio.reshape(-1, 1))
+            if not wrote_any:
+                from time import strftime
+
+                tts_latency = time.monotonic() - tts_start
+                print(f"[{strftime('%H:%M:%S')}] TTS latency: {tts_latency:.2f} sec")
             wrote_any = True
         # Let the output ring-buffer drain before closing the stream.
         if wrote_any:

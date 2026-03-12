@@ -284,12 +284,16 @@ class VoiceAgent:
 
     def _respond_worker(self, user_text: str) -> None:
         """Background worker: LLM → TTS → playback."""
+        import time as _time
 
         try:
             _log(f"User: {user_text!r}")
             self._session_summary["turns"].append({"user_text": user_text})
 
+            t0 = _time.monotonic()
             assistant_text = generate_ai_response(user_text)
+            llm_elapsed = _time.monotonic() - t0
+            _log(f"LLM latency: {llm_elapsed:.2f} sec")
             _log(f"Assistant: {assistant_text!r}")
 
             # Pause STT while speaking to avoid echo.
@@ -298,6 +302,10 @@ class VoiceAgent:
                 self.speak(assistant_text)
             finally:
                 self._stt.resume()
+
+            stt_latency = getattr(self._stt, "_last_decode_seconds", 0.0)
+            total = stt_latency + llm_elapsed
+            _log(f"TOTAL pipeline latency: {total:.2f} sec")
 
             # Persist conversation turn.
             self._session_summary["turns"][-1]["assistant_text"] = assistant_text
