@@ -407,7 +407,9 @@ class StreamingWhisper:
             "language": self.language,
             "task": self.task,
             "without_timestamps": True,
-            "condition_on_previous_text": True,
+            "condition_on_previous_text": _parse_bool_env(
+                "VOICE_AGENT_WHISPER_CONDITION_ON_PREV", False
+            ),
         }
 
         if initial_prompt:

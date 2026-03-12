@@ -5,9 +5,10 @@ Public API:
 - warmup_llm: preload the LLM model.
 """
 
-from .agent import generate_ai_response, warmup_llm
+from .agent import generate_ai_response, stream_ai_response_sentences, warmup_llm
 
 __all__ = [
     "generate_ai_response",
+    "stream_ai_response_sentences",
     "warmup_llm",
 ]

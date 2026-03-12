@@ -33,6 +33,7 @@ from functools import lru_cache
 from typing import Deque, List, Tuple
 
 _SENTENCE_END_RE = re.compile(r"[.!?]")
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?]\s")
 
 
 def _trim_to_last_sentence(text: str) -> str:
@@ -452,3 +453,75 @@ def generate_ai_response(user_text: str) -> str:
 
     session.append_turn(text, assistant_text)
     return assistant_text
+
+
+def stream_ai_response_sentences(user_text: str):
+    """Stream LLM response, yielding complete sentences as they form.
+
+    Uses ``chat.stream()`` instead of ``chat.invoke()`` so the first sentence
+    can be spoken by TTS while the LLM is still generating the rest.
+    """
+
+    text = (user_text or "").strip()
+    if not text:
+        yield "Je n'ai pas bien compris. En quoi puis-je vous aider ?"
+        return
+
+    chat = _get_chat_model()
+    session = _get_session()
+    messages = session.build_messages(text)
+
+    buffer = ""
+    full_response = ""
+    _MAX_BUFFER = 200  # Force-yield if no punctuation found
+
+    try:
+        for chunk in chat.stream(messages):
+            token = getattr(chunk, "content", "") or ""
+            if not token:
+                continue
+            buffer += token
+            full_response += token
+
+            # Extract complete sentences from the buffer.
+            while True:
+                match = _SENTENCE_SPLIT_RE.search(buffer)
+                if match:
+                    end = match.start() + 1  # include punctuation, not trailing space
+                    sentence = buffer[:end].strip()
+                    buffer = buffer[end:].lstrip()
+                    if sentence:
+                        yield sentence
+                    continue
+                if len(buffer) > _MAX_BUFFER:
+                    forced = buffer.strip()
+                    buffer = ""
+                    if forced:
+                        yield forced
+                break
+
+        # Yield remaining text.
+        remaining = buffer.strip()
+        if remaining:
+            yield remaining
+
+        # Update conversation session.
+        assistant_text = _trim_to_last_sentence(full_response.strip())
+        if not assistant_text:
+            assistant_text = (
+                full_response.strip()
+                or "Je suis désolé, je ne parviens pas à formuler une réponse pour le moment."
+            )
+        session.append_turn(text, assistant_text)
+
+    except Exception:
+        remaining = buffer.strip()
+        if remaining:
+            yield remaining
+        final = (
+            full_response.strip()
+            or "Je suis désolé, je ne parviens pas à formuler une réponse pour le moment."
+        )
+        if not full_response.strip():
+            yield final
+        session.append_turn(text, final)

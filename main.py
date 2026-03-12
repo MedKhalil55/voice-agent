@@ -28,7 +28,7 @@ from time import strftime
 
 from dotenv import load_dotenv
 
-from llm import generate_ai_response, warmup_llm
+from llm import generate_ai_response, stream_ai_response_sentences, warmup_llm
 from stt import StreamingWhisper, warmup_stt
 from stt.streaming_whisper import VadConfig
 from tts import speak_streaming, warmup_tts
@@ -283,7 +283,11 @@ class VoiceAgent:
         Thread(target=self._respond_worker, args=(cleaned,), daemon=True).start()
 
     def _respond_worker(self, user_text: str) -> None:
-        """Background worker: LLM → TTS → playback."""
+        """Background worker: streamed LLM → TTS → playback.
+
+        Streams LLM tokens, detects sentence boundaries, and speaks each
+        sentence immediately so TTS playback overlaps with LLM generation.
+        """
         import time as _time
 
         try:
@@ -291,21 +295,33 @@ class VoiceAgent:
             self._session_summary["turns"].append({"user_text": user_text})
 
             t0 = _time.monotonic()
-            assistant_text = generate_ai_response(user_text)
-            llm_elapsed = _time.monotonic() - t0
-            _log(f"LLM latency: {llm_elapsed:.2f} sec")
-            _log(f"Assistant: {assistant_text!r}")
+            first_audio_time = None
+            full_response_parts = []
 
-            # Pause STT while speaking to avoid echo.
+            # Pause STT while responding to avoid echo.
             self._stt.pause()
             try:
-                self.speak(assistant_text)
+                for sentence in stream_ai_response_sentences(user_text):
+                    sentence = (sentence or "").strip()
+                    if not sentence:
+                        continue
+
+                    full_response_parts.append(sentence)
+
+                    if first_audio_time is None:
+                        first_audio_time = _time.monotonic() - t0
+                        _log(f"LLM first-sentence latency: {first_audio_time:.2f} sec")
+
+                    self.speak(sentence)
             finally:
                 self._stt.resume()
 
+            assistant_text = " ".join(full_response_parts)
+            _log(f"Assistant: {assistant_text!r}")
+
             stt_latency = getattr(self._stt, "_last_decode_seconds", 0.0)
-            total = stt_latency + llm_elapsed
-            _log(f"TOTAL pipeline latency: {total:.2f} sec")
+            perceived = stt_latency + (first_audio_time or 0.0)
+            _log(f"TOTAL perceived latency: {perceived:.2f} sec")
 
             # Persist conversation turn.
             self._session_summary["turns"][-1]["assistant_text"] = assistant_text
