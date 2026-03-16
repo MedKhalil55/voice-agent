@@ -78,30 +78,11 @@ def _env(name: str, default: str) -> str:
 
 
 def _build_system_prompt() -> str:
-    """System prompt for a banking voice assistant.
-
-    Prompt engineering notes
-    ------------------------
-    1) Role clarity: The system message defines the assistant persona and domain.
-       This reduces "role drift" and keeps outputs consistent.
-
-    2) Safety + compliance: In banking contexts, the assistant should avoid
-       requesting or exposing sensitive data. We explicitly instruct it to:
-       - not ask for full card numbers, CVV, or passwords
-       - encourage secure channels for authentication
-       - provide general guidance and next steps
-
-    3) Voice-first style: Voice assistants must be concise, confirm intent, and
-       avoid long paragraphs. We request short sentences and clarifying questions.
-
-    4) Determinism: We also instruct the model to be structured, which improves
-       reliability in downstream voice UX (TTS) and reduces hallucinated steps.
-    """
-
     return (
-        "Assistant vocal bancaire. Répondez en français en UNE seule phrase courte (15-20 mots max). Ton pro, empathique.\n"
-        "Solutions simples: échelonnement, report, paiement partiel. Pas de Markdown, pas de liste.\n"
-        "INTERDIT: mot de passe, PIN, CVV, numéro carte, OTP.\n"
+        "Vous êtes un agent vocal de recouvrement d'une banque, en français (vouvoiement). Ton: formel, empathique, ferme, jamais agressif.\n"
+        "Objectif: comprendre la situation, proposer une prochaine étape concrète et sûre (échelonnement, report, paiement partiel) et demander au plus UNE info de clarification non sensible.\n"
+        "Style voix: 1 à 2 phrases courtes, une seule idée principale, un seul paragraphe, pas de listes/Markdown.\n"
+        "Sécurité: ne jamais demander ni répéter mot de passe, PIN, CVV, numéro de carte, OTP, identifiants; orienter vers canaux officiels pour authentification.\n"
     )
 
 
@@ -154,7 +135,9 @@ def _state_guidance(state: ConversationState) -> str:
     if state == ConversationState.INTRO:
         return "INTRO: expliquer l'objet de l'appel, poser une question ciblée.\n"
     if state == ConversationState.DISCOVERY:
-        return "DISCOVERY: recueillir infos minimales non sensibles, proposer un plan.\n"
+        return (
+            "DISCOVERY: recueillir infos minimales non sensibles, proposer un plan.\n"
+        )
     if state == ConversationState.NEGOTIATION:
         return "NEGOTIATION: proposer options réalistes, demander confirmation. Pas d'identifiants.\n"
     return "CLOSING: résumer la solution, indiquer la prochaine étape officielle.\n"
@@ -348,7 +331,8 @@ def _get_chat_model():
 
     # Temperature: lower values -> more consistent answers.
     # For voice assistants, consistency matters more than creative variation.
-    model_name = _env("VOICE_AGENT_OLLAMA_MODEL", "llama3.2")
+    # Model: small local model for low TTFT on consumer GPUs.
+    model_name = _env("VOICE_AGENT_OLLAMA_MODEL", "qwen2.5:3b")
     base_url = _env("VOICE_AGENT_OLLAMA_BASE_URL", "http://localhost:11434")
     keep_alive = _env("VOICE_AGENT_OLLAMA_KEEP_ALIVE", "10m").strip() or None
 
@@ -356,17 +340,56 @@ def _get_chat_model():
     # - num_predict: caps output tokens -> faster + shorter spoken responses.
     # - num_ctx: context window; smaller can be faster and uses less memory.
     # - num_gpu/num_thread: advanced knobs; leave unset unless you know why.
+    # num_predict: cap output tokens -> shorter speech + lower latency.
     num_predict = _parse_optional_int_env("VOICE_AGENT_OLLAMA_NUM_PREDICT")
+    # num_ctx: keep context window moderate -> faster prompt evaluation.
     num_ctx = _parse_optional_int_env("VOICE_AGENT_OLLAMA_NUM_CTX")
     num_gpu = _parse_optional_int_env("VOICE_AGENT_OLLAMA_NUM_GPU")
     num_thread = _parse_optional_int_env("VOICE_AGENT_OLLAMA_NUM_THREAD")
+    # temperature: low randomness for consistent, professional answers.
     temperature = _parse_optional_float_env("VOICE_AGENT_OLLAMA_TEMPERATURE")
+
+    # top_p/top_k: stable nucleus + limited candidates for coherent short replies.
+    top_p = _parse_optional_float_env("VOICE_AGENT_OLLAMA_TOP_P")
+    top_k = _parse_optional_int_env("VOICE_AGENT_OLLAMA_TOP_K")
+
+    # repeat_*: reduce looping/rambling, important for TTS UX.
+    repeat_penalty = _parse_optional_float_env("VOICE_AGENT_OLLAMA_REPEAT_PENALTY")
+    repeat_last_n = _parse_optional_int_env("VOICE_AGENT_OLLAMA_REPEAT_LAST_N")
+
+    # stop: avoid multi-paragraph responses (keep one paragraph for voice).
+    # Use env override as comma-separated values if needed.
+    stop_raw = _env("VOICE_AGENT_OLLAMA_STOP", "").strip()
+    stop = (
+        [s for s in (p.strip() for p in stop_raw.split(",")) if s] if stop_raw else None
+    )
+
+    # seed: set only if you need repeatable responses for demos/tests.
+    seed = _parse_optional_int_env("VOICE_AGENT_OLLAMA_SEED")
+
+    # mirostat: leave disabled by default for predictable latency.
+    mirostat = _parse_optional_int_env("VOICE_AGENT_OLLAMA_MIROSTAT")
 
     # Good default for phone-like UX if not overridden.
     if num_predict is None:
-        num_predict = 35
+        num_predict = 48
     if temperature is None:
         temperature = 0.2
+    if top_p is None:
+        top_p = 0.9
+    if top_k is None:
+        top_k = 40
+    if repeat_penalty is None:
+        repeat_penalty = 1.12
+    if repeat_last_n is None:
+        repeat_last_n = 64
+    if mirostat is None:
+        mirostat = 0
+
+    # Default stop tokens for voice UX: stop on double newline (paragraph break).
+    if stop is None:
+      stop = ["\n\n", "<|im_end|>", "<|endoftext|>"]
+
 
     return chat_ollama(
         model=model_name,
@@ -374,6 +397,13 @@ def _get_chat_model():
         temperature=temperature,
         num_predict=num_predict,
         num_ctx=num_ctx,
+        top_p=top_p,
+        top_k=top_k,
+        repeat_penalty=repeat_penalty,
+        repeat_last_n=repeat_last_n,
+        seed=seed,
+        stop=stop,
+        mirostat=mirostat,
         num_gpu=num_gpu,
         num_thread=num_thread,
         keep_alive=keep_alive,
@@ -421,13 +451,18 @@ def _get_ollama_http():
     if _OLLAMA_HTTP is None:
         import httpx  # transitive dep of langchain-ollama
 
-        _OLLAMA_HTTP = httpx.Client(timeout=httpx.Timeout(60.0, connect=5.0))
+        _OLLAMA_HTTP = httpx.Client(
+            timeout=httpx.Timeout(60.0, connect=5.0),
+            headers={"Connection": "keep-alive"},
+            http1=True,
+        )
     return _OLLAMA_HTTP
 
 
 def _stream_ollama_tokens(messages_raw: list[dict]):
     """Stream tokens from Ollama /api/chat, bypassing LangChain overhead."""
-    model = _env("VOICE_AGENT_OLLAMA_MODEL", "llama3.2")
+    # Model: default to a small local model for low TTFT.
+    model = _env("VOICE_AGENT_OLLAMA_MODEL", "qwen2.5:3b")
     base_url = _env("VOICE_AGENT_OLLAMA_BASE_URL", "http://localhost:11434")
     keep_alive = _env("VOICE_AGENT_OLLAMA_KEEP_ALIVE", "10m").strip() or None
 
@@ -435,6 +470,16 @@ def _stream_ollama_tokens(messages_raw: list[dict]):
     for key, env_name, parser in (
         ("num_predict", "VOICE_AGENT_OLLAMA_NUM_PREDICT", _parse_optional_int_env),
         ("num_ctx", "VOICE_AGENT_OLLAMA_NUM_CTX", _parse_optional_int_env),
+        ("top_p", "VOICE_AGENT_OLLAMA_TOP_P", _parse_optional_float_env),
+        ("top_k", "VOICE_AGENT_OLLAMA_TOP_K", _parse_optional_int_env),
+        (
+            "repeat_penalty",
+            "VOICE_AGENT_OLLAMA_REPEAT_PENALTY",
+            _parse_optional_float_env,
+        ),
+        ("repeat_last_n", "VOICE_AGENT_OLLAMA_REPEAT_LAST_N", _parse_optional_int_env),
+        ("seed", "VOICE_AGENT_OLLAMA_SEED", _parse_optional_int_env),
+        ("mirostat", "VOICE_AGENT_OLLAMA_MIROSTAT", _parse_optional_int_env),
         ("num_gpu", "VOICE_AGENT_OLLAMA_NUM_GPU", _parse_optional_int_env),
         ("num_thread", "VOICE_AGENT_OLLAMA_NUM_THREAD", _parse_optional_int_env),
         ("temperature", "VOICE_AGENT_OLLAMA_TEMPERATURE", _parse_optional_float_env),
@@ -442,8 +487,26 @@ def _stream_ollama_tokens(messages_raw: list[dict]):
         val = parser(env_name)
         if val is not None:
             options[key] = val
-    options.setdefault("num_predict", 35)
+
+    # num_predict: low cap reduces rambling and improves TTS latency.
+    options.setdefault("num_predict", 48)
+    # temperature: low randomness for stable/professional voice responses.
     options.setdefault("temperature", 0.2)
+    # top_p/top_k: keep decoding focused and coherent.
+    options.setdefault("top_p", 0.9)
+    options.setdefault("top_k", 40)
+    # repeat_penalty/repeat_last_n: avoid repeated phrases (annoying in audio).
+    options.setdefault("repeat_penalty", 1.12)
+    options.setdefault("repeat_last_n", 64)
+    # mirostat: disable for predictable latency.
+    options.setdefault("mirostat", 0)
+
+    # stop tokens: keep one paragraph (voice-friendly). Can be overridden.
+    stop_raw = _env("VOICE_AGENT_OLLAMA_STOP", "").strip()
+    if stop_raw:
+        options["stop"] = [s for s in (p.strip() for p in stop_raw.split(",")) if s]
+    else:
+        options.setdefault("stop", ["\n\n"])
 
     payload: dict = {
         "model": model,
@@ -456,17 +519,34 @@ def _stream_ollama_tokens(messages_raw: list[dict]):
 
     url = f"{base_url.rstrip('/')}/api/chat"
     client = _get_ollama_http()
+    import time
+    _t0 = time.perf_counter()
+    first_token = True
+
+
 
     with client.stream("POST", url, json=payload) as resp:
         resp.raise_for_status()
         for line in resp.iter_lines():
+            # inside the for loop, at the top:
+            if first_token:
+             print(f"[DIAG] Time to first token: {time.perf_counter() - _t0:.3f}s")
+             first_token = False
+
             if not line:
                 continue
             data = _json.loads(line)
             token = data.get("message", {}).get("content", "")
             if token:
+                if first_token:
+                   print(f"[DIAG] TTFT: {time.perf_counter() - _t0:.3f}s")
+                   first_token = False
                 yield token
             if data.get("done", False):
+                # Log total generation time
+                print(f"[DIAG] Total gen: {time.perf_counter() - _t0:.3f}s | "
+                   f"prompt_eval: {data.get('prompt_eval_duration',0)/1e9:.3f}s | "
+                   f"eval: {data.get('eval_duration',0)/1e9:.3f}s")
                 break
 
 
@@ -517,7 +597,7 @@ def stream_ai_response_sentences(user_text: str):
 
     buffer = ""
     full_response = ""
-    _MAX_BUFFER = 200  # Force-yield if no punctuation found
+    _MAX_BUFFER = 200  # Force-yield at a word boundary if no punctuation found
 
     try:
         for token in _stream_ollama_tokens(messages):
@@ -535,16 +615,28 @@ def stream_ai_response_sentences(user_text: str):
                         yield sentence
                     continue
                 if len(buffer) > _MAX_BUFFER:
-                    forced = buffer.strip()
-                    buffer = ""
+                    # Force-yield without cutting mid-word. Keep the remainder.
+                    cut = buffer.rfind(" ")
+                    if cut > 0:
+                        forced = buffer[:cut].strip()
+                        buffer = buffer[cut:].lstrip()
+                    else:
+                        forced = buffer.strip()
+                        buffer = ""
                     if forced:
                         yield forced
                 break
 
-        # Yield remaining text.
+        # Yield remaining text only if it contains a complete sentence.
         remaining = buffer.strip()
         if remaining:
-            yield remaining
+            last_end = -1
+            for match in _SENTENCE_END_RE.finditer(remaining):
+                last_end = match.end()
+            if last_end > 0:
+                tail_sentence = remaining[:last_end].strip()
+                if tail_sentence:
+                    yield tail_sentence
 
         # Update conversation session.
         assistant_text = _trim_to_last_sentence(full_response.strip())
@@ -558,7 +650,13 @@ def stream_ai_response_sentences(user_text: str):
     except Exception:
         remaining = buffer.strip()
         if remaining:
-            yield remaining
+            last_end = -1
+            for match in _SENTENCE_END_RE.finditer(remaining):
+                last_end = match.end()
+            if last_end > 0:
+                tail_sentence = remaining[:last_end].strip()
+                if tail_sentence:
+                    yield tail_sentence
         final = (
             full_response.strip()
             or "Je suis désolé, je ne parviens pas à formuler une réponse pour le moment."
