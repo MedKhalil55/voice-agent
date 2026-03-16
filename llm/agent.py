@@ -154,7 +154,9 @@ def _state_guidance(state: ConversationState) -> str:
     if state == ConversationState.INTRO:
         return "INTRO: expliquer l'objet de l'appel, poser une question ciblée.\n"
     if state == ConversationState.DISCOVERY:
-        return "DISCOVERY: recueillir infos minimales non sensibles, proposer un plan.\n"
+        return (
+            "DISCOVERY: recueillir infos minimales non sensibles, proposer un plan.\n"
+        )
     if state == ConversationState.NEGOTIATION:
         return "NEGOTIATION: proposer options réalistes, demander confirmation. Pas d'identifiants.\n"
     return "CLOSING: résumer la solution, indiquer la prochaine étape officielle.\n"
@@ -435,6 +437,7 @@ def _stream_ollama_tokens(messages_raw: list[dict]):
     for key, env_name, parser in (
         ("num_predict", "VOICE_AGENT_OLLAMA_NUM_PREDICT", _parse_optional_int_env),
         ("num_ctx", "VOICE_AGENT_OLLAMA_NUM_CTX", _parse_optional_int_env),
+        ("num_keep", "VOICE_AGENT_OLLAMA_NUM_KEEP", _parse_optional_int_env),
         ("num_gpu", "VOICE_AGENT_OLLAMA_NUM_GPU", _parse_optional_int_env),
         ("num_thread", "VOICE_AGENT_OLLAMA_NUM_THREAD", _parse_optional_int_env),
         ("temperature", "VOICE_AGENT_OLLAMA_TEMPERATURE", _parse_optional_float_env),
@@ -444,6 +447,10 @@ def _stream_ollama_tokens(messages_raw: list[dict]):
             options[key] = val
     options.setdefault("num_predict", 35)
     options.setdefault("temperature", 0.2)
+
+    # IMPORTANT: keep initial prompt tokens cached for faster subsequent turns.
+    # This is most effective when the system prompt / prefix stays stable.
+    options.setdefault("num_keep", 48)
 
     payload: dict = {
         "model": model,
@@ -517,7 +524,7 @@ def stream_ai_response_sentences(user_text: str):
 
     buffer = ""
     full_response = ""
-    _MAX_BUFFER = 200  # Force-yield if no punctuation found
+    _MAX_BUFFER = 200  # Force-yield at a word boundary if no punctuation found
 
     try:
         for token in _stream_ollama_tokens(messages):
@@ -535,16 +542,29 @@ def stream_ai_response_sentences(user_text: str):
                         yield sentence
                     continue
                 if len(buffer) > _MAX_BUFFER:
-                    forced = buffer.strip()
-                    buffer = ""
+                    # Force-yield without cutting mid-word. Keep the remainder.
+                    cut = buffer.rfind(" ")
+                    if cut > 0:
+                        forced = buffer[:cut].strip()
+                        buffer = buffer[cut:].lstrip()
+                    else:
+                        forced = buffer.strip()
+                        buffer = ""
                     if forced:
                         yield forced
                 break
 
-        # Yield remaining text.
+        # Yield remaining text only if it contains a complete sentence.
         remaining = buffer.strip()
         if remaining:
-            yield remaining
+            # Find the last sentence-ending punctuation inside the remainder.
+            last_end = -1
+            for match in _SENTENCE_END_RE.finditer(remaining):
+                last_end = match.end()
+            if last_end > 0:
+                tail_sentence = remaining[:last_end].strip()
+                if tail_sentence:
+                    yield tail_sentence
 
         # Update conversation session.
         assistant_text = _trim_to_last_sentence(full_response.strip())
@@ -558,7 +578,13 @@ def stream_ai_response_sentences(user_text: str):
     except Exception:
         remaining = buffer.strip()
         if remaining:
-            yield remaining
+            last_end = -1
+            for match in _SENTENCE_END_RE.finditer(remaining):
+                last_end = match.end()
+            if last_end > 0:
+                tail_sentence = remaining[:last_end].strip()
+                if tail_sentence:
+                    yield tail_sentence
         final = (
             full_response.strip()
             or "Je suis désolé, je ne parviens pas à formuler une réponse pour le moment."
