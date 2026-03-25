@@ -91,37 +91,91 @@ def _needs_tool_call(transcript: str, tool_results: List[Dict]) -> bool:
 def _agent_node(state: AgentState) -> AgentState:
     """Reasoning node using the existing generate_ai_response function."""
 
+    def parse_llm_output(text: str) -> dict:
+        """Parse optional tool instruction from LLM output.
+
+        Expected format: ACTION:tool NAME:xxx ARGS:{...}
+        Falls back to a direct response payload when parsing fails.
+        """
+
+        fallback = {"action": "respond", "message": (text or "").strip()}
+        try:
+            raw = (text or "").strip()
+            if not raw:
+                return fallback
+
+            one_line = " ".join(raw.replace("\n", " ").split())
+            action_pos = one_line.find("ACTION:")
+            name_pos = one_line.find("NAME:")
+            args_pos = one_line.find("ARGS:")
+
+            if action_pos < 0 or name_pos < 0 or args_pos < 0:
+                return fallback
+            if not (action_pos < name_pos < args_pos):
+                return fallback
+
+            action = one_line[action_pos + len("ACTION:") : name_pos].strip().lower()
+            name = one_line[name_pos + len("NAME:") : args_pos].strip()
+            args_text = one_line[args_pos + len("ARGS:") :].strip()
+
+            if action != "tool" or not name:
+                return fallback
+
+            import json
+
+            args: dict = {}
+            if args_text:
+                left = args_text.find("{")
+                right = args_text.rfind("}")
+                if left >= 0 and right > left:
+                    candidate = args_text[left : right + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, dict):
+                            args = parsed
+                    except Exception:
+                        # Keep the tool action even when ARGS is not strict JSON.
+                        args = {}
+
+            return {"action": "tool", "name": name, "args": args}
+        except Exception:
+            return fallback
+
     transcript = (state.get("transcript") or "").strip()
     rag_context = (state.get("rag_context") or "").strip()
     tool_results = state.get("tool_results") or []
-
-    if _needs_tool_call(transcript, tool_results):
-        tool_calls = [
-            {
-                "name": "mock_account_lookup",
-                "args": {"query": transcript},
-            }
-        ]
-        return {
-            "tool_calls": tool_calls,
-            "response_text": "",
-        }
 
     tool_results_text = (
         "\n".join(str(item) for item in tool_results) if tool_results else "none"
     )
     prompt = (
-        "You are a voice AI assistant. Use the available context and tool outputs to answer. "
-        "Respond briefly and clearly in one short paragraph.\n\n"
-        f"User transcript:\n{transcript}\n\n"
-        f"RAG context:\n{rag_context or 'none'}\n\n"
-        f"Tool results:\n{tool_results_text}"
+        "You are a voice AI assistant with optional tools.\n"
+        "If a tool is required, output exactly one line in this format:\n"
+        "ACTION:tool NAME:<tool_name> ARGS:<json_object>\n"
+        "If no tool is required, output a direct user-facing answer only.\n\n"
+        "Context for this turn:\n"
+        f"TRANSCRIPT:\n{transcript or 'none'}\n\n"
+        f"RAG_CONTEXT:\n{rag_context or 'none'}\n\n"
+        f"TOOL_RESULTS:\n{tool_results_text}"
     )
 
-    response = generate_ai_response(prompt)
+    llm_output = (generate_ai_response(prompt) or "").strip()
+    parsed = parse_llm_output(llm_output)
+
+    if parsed.get("action") == "tool":
+        return {
+            "tool_calls": [
+                {
+                    "name": parsed.get("name", ""),
+                    "args": parsed.get("args") or {},
+                }
+            ],
+            "response_text": "",
+        }
+
     return {
         "tool_calls": [],
-        "response_text": (response or "").strip(),
+        "response_text": parsed.get("message", llm_output),
     }
 
 
@@ -157,6 +211,9 @@ def _tool_executor_node(state: AgentState) -> AgentState:
     tools = {
         "mock_account_lookup": _mock_account_lookup,
         "mock_payment_plan": _mock_payment_plan,
+        # Accept common LLM aliases for the same mock tools.
+        "get_account_lookup": _mock_account_lookup,
+        "get_payment_plan": _mock_payment_plan,
     }
 
     results: List[Dict] = []
@@ -252,7 +309,9 @@ def run_voice_agent_turn(transcript: str) -> AgentState:
 
 
 if __name__ == "__main__":
-    result = run_voice_agent_turn("recommende moi un plan de paiement pour mon compte en arrears")
+    result = run_voice_agent_turn(
+        "recommende moi un plan de paiement pour mon compte en arrears"
+    )
 
     print("transcript:    ", result["transcript"])
     print("rag_context:   ", result["rag_context"])
