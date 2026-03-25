@@ -106,17 +106,46 @@ def _agent_node(state: AgentState) -> AgentState:
 
             one_line = " ".join(raw.replace("\n", " ").split())
             action_pos = one_line.find("ACTION:")
-            name_pos = one_line.find("NAME:")
-            args_pos = one_line.find("ARGS:")
+            name_label = "NAME:"
+            name_pos = one_line.find(name_label)
+            if name_pos < 0:
+                name_label = "NAME="
+                name_pos = one_line.find(name_label)
 
-            if action_pos < 0 or name_pos < 0 or args_pos < 0:
+            if action_pos < 0 or name_pos < 0:
                 return fallback
-            if not (action_pos < name_pos < args_pos):
+            if not (action_pos < name_pos):
                 return fallback
 
             action = one_line[action_pos + len("ACTION:") : name_pos].strip().lower()
-            name = one_line[name_pos + len("NAME:") : args_pos].strip()
-            args_text = one_line[args_pos + len("ARGS:") :].strip()
+
+            # Accept both formats:
+            # 1) ACTION:tool NAME:xxx ARGS:{...}
+            # 2) ACTION:tool NAME:xxx<json_object>{...}
+            remainder = one_line[name_pos + len(name_label) :].strip()
+            args_label = "ARGS:"
+            args_pos = remainder.find(args_label)
+            if args_pos < 0:
+                args_label = "ARGS="
+                args_pos = remainder.find(args_label)
+            marker_pos = remainder.find("<json_object>")
+            brace_pos = remainder.find("{")
+
+            split_positions = [p for p in (args_pos, marker_pos, brace_pos) if p >= 0]
+            if split_positions:
+                cut = min(split_positions)
+                name = remainder[:cut].strip()
+            else:
+                name = remainder.strip()
+
+            if args_pos >= 0:
+                args_text = remainder[args_pos + len(args_label) :].strip()
+            elif marker_pos >= 0:
+                args_text = remainder[marker_pos + len("<json_object>") :].strip()
+            elif brace_pos >= 0:
+                args_text = remainder[brace_pos:].strip()
+            else:
+                args_text = ""
 
             if action != "tool" or not name:
                 return fallback
@@ -213,7 +242,9 @@ def _tool_executor_node(state: AgentState) -> AgentState:
         "mock_payment_plan": _mock_payment_plan,
         # Accept common LLM aliases for the same mock tools.
         "get_account_lookup": _mock_account_lookup,
+        "get_client_info": _mock_account_lookup,
         "get_payment_plan": _mock_payment_plan,
+        "get_arrears": _mock_account_lookup,
     }
 
     results: List[Dict] = []
@@ -221,6 +252,24 @@ def _tool_executor_node(state: AgentState) -> AgentState:
         name = call.get("name", "")
         args = call.get("args") or {}
         tool_fn = tools.get(name)
+
+        if tool_fn is None:
+            normalized = str(name).strip().lower().replace("_", " ").replace("-", " ")
+            if (
+                "arrear" in normalized
+                or "outstanding" in normalized
+                or "solde" in normalized
+                or "client" in normalized
+                or "account" in normalized
+            ):
+                tool_fn = _mock_account_lookup
+            elif (
+                "payment" in normalized
+                or "plan" in normalized
+                or "mensual" in normalized
+                or "echeancier" in normalized
+            ):
+                tool_fn = _mock_payment_plan
 
         if tool_fn is None:
             results.append(
@@ -293,8 +342,48 @@ def build_voice_agent_graph():
     return graph.compile()
 
 
+def seed_chroma() -> None:
+    """Populate Chroma collection once with baseline French banking documents."""
+
+    collection = _get_chroma_collection()
+
+    # Avoid duplicates: seed only if collection is empty.
+    try:
+        if int(collection.count()) > 0:
+            return
+    except Exception:
+        return
+
+    documents = [
+        "Client en retard de paiement: proposer un echeancier adapte a sa capacite financiere.",
+        "En cas de retard superieur a 30 jours, presenter un plan de regularisation en plusieurs mensualites.",
+        "Si le client refuse de payer, envoyer une reclamation formelle avec les details de la dette.",
+        "Apres un refus explicite de paiement, informer le client des etapes officielles de recouvrement.",
+        "Client agressif: garder un ton calme, professionnel et factuel en toutes circonstances.",
+        "Face a des propos hostiles, ne pas repondre a l'agressivite et recentrer sur la solution de paiement.",
+        "Demande de solde: consulter le compte et communiquer uniquement les informations pertinentes.",
+        "Pour une demande de solde, verifier les echeances en retard avant de proposer un plan.",
+        "Negociation de delai: proposer entre 3 et 6 mensualites selon le montant impaye.",
+        "Si le client demande un report, proposer une premiere echeance proche et des mensualites realistes.",
+        "Procedure de relance: commencer par un rappel amiable avant la lettre de mise en demeure.",
+        "En absence de paiement apres relances, envoyer une lettre de mise en demeure conforme a la procedure.",
+        "Client cooperatif: confirmer le plan d'action, les dates et les montants convenus.",
+        "Quand le client accepte un echeancier, remercier et rappeler les prochaines etapes officielles.",
+        "Toujours conclure avec un resume clair de l'accord et des canaux de contact de la banque.",
+    ]
+
+    ids = [f"fr_bank_doc_{i:03d}" for i in range(1, len(documents) + 1)]
+
+    try:
+        collection.add(ids=ids, documents=documents)
+    except Exception:
+        # Seeding must not block app startup.
+        return
+
+
 # Compile once at module level — not inside run_voice_agent_turn()
 _app = build_voice_agent_graph()
+seed_chroma()
 
 
 def run_voice_agent_turn(transcript: str) -> AgentState:
@@ -305,13 +394,11 @@ def run_voice_agent_turn(transcript: str) -> AgentState:
         "tool_results": [],
         "response_text": "",
     }
-    return _app.invoke(initial_state)
+    return _app.invoke(initial_state, config={"recursion_limit": 10})
 
 
 if __name__ == "__main__":
-    result = run_voice_agent_turn(
-        "recommende moi un plan de paiement pour mon compte en arrears"
-    )
+    result = run_voice_agent_turn("bonjour")
 
     print("transcript:    ", result["transcript"])
     print("rag_context:   ", result["rag_context"])
