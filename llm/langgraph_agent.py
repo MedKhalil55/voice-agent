@@ -9,6 +9,7 @@ retrieve -> agent -> conditional
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from importlib import import_module
 from typing import Dict, List, TypedDict
 
@@ -32,21 +33,101 @@ def _get_chroma_collection():
     """Get or create the default Chroma collection used for retrieval."""
 
     chromadb = import_module("chromadb")
+    embedding_functions = import_module("chromadb.utils.embedding_functions")
 
     chroma_path = os.environ.get("VOICE_AGENT_CHROMA_PATH", "artifacts/chroma")
     collection_name = os.environ.get(
-        "VOICE_AGENT_CHROMA_COLLECTION", "voice_agent_docs"
+        "VOICE_AGENT_CHROMA_COLLECTION", "voice_agent_docs_mxbai"
+    )
+    ollama_base_url = os.environ.get(
+        "VOICE_AGENT_OLLAMA_BASE_URL", "http://localhost:11434"
+    )
+    embedding_model = os.environ.get(
+        "VOICE_AGENT_EMBED_MODEL", "mxbai-embed-large:latest"
+    )
+
+    embedding_fn = embedding_functions.OllamaEmbeddingFunction(
+        url=f"{ollama_base_url.rstrip('/')}/api/embeddings",
+        model_name=embedding_model,
     )
 
     client = chromadb.PersistentClient(path=chroma_path)
+
+    def _open_or_create(name: str):
+        try:
+            return client.get_collection(name=name, embedding_function=embedding_fn)
+        except Exception:
+            return client.create_collection(
+                name=name,
+                embedding_function=embedding_fn,
+                metadata={"hnsw:space": "cosine"},
+            )
+
     try:
-        return client.get_collection(name=collection_name)
+        return _open_or_create(collection_name)
     except Exception:
-        return client.create_collection(name=collection_name)
+        # If a collection already exists with a different embedding function,
+        # switch to a dedicated mxbai collection name.
+        fallback_name = f"{collection_name}_mxbai"
+        return _open_or_create(fallback_name)
+
+
+def _extract_pdf_text(pdf_path: Path) -> str:
+    """Extract plain text from PDF pages."""
+
+    try:
+        pypdf = import_module("pypdf")
+        PdfReader = pypdf.PdfReader
+    except Exception:
+        return ""
+
+    try:
+        reader = PdfReader(str(pdf_path))
+    except Exception:
+        return ""
+
+    pages: List[str] = []
+    for page in reader.pages:
+        try:
+            page_text = page.extract_text() or ""
+        except Exception:
+            page_text = ""
+        if page_text.strip():
+            pages.append(page_text)
+
+    return "\n\n".join(pages)
+
+
+def _chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
+    """Split text into overlapping character chunks."""
+
+    source = " ".join((text or "").split())
+    if not source:
+        return []
+
+    size = max(int(chunk_size), 200)
+    overlap = max(0, min(int(chunk_overlap), size - 1))
+    step = max(1, size - overlap)
+
+    chunks: List[str] = []
+    start = 0
+    while start < len(source):
+        end = min(start + size, len(source))
+        chunk = source[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(source):
+            break
+        start += step
+    return chunks
 
 
 def _retrieve_node(state: AgentState) -> AgentState:
-    """Retrieve relevant context from ChromaDB using the transcript as a query."""
+    """Retrieve relevant context from ChromaDB using the transcript as a query.
+
+    Always runs - provides RAG context for every query.
+    The LLM will decide how to use this context (or ignore it if not relevant).
+    """
 
     transcript = (state.get("transcript") or "").strip()
     if not transcript:
@@ -56,156 +137,265 @@ def _retrieve_node(state: AgentState) -> AgentState:
         collection = _get_chroma_collection()
         result = collection.query(
             query_texts=[transcript],
-            n_results=3,
-            include=["documents"],
+            n_results=5,
+            include=["documents", "distances"],
         )
         docs = (result.get("documents") or [[]])[0]
-        rag_context = "\n".join(d for d in docs if isinstance(d, str) and d.strip())
+        distances = (result.get("distances") or [[]])[0]
+
+        # Rerank results by semantic similarity + lightweight lexical overlap.
+        # Pure embedding distance can sometimes miss the best chunk for
+        # product names / abbreviations.
+        query_terms = [t for t in transcript.lower().split() if len(t) >= 4]
+        query_term_set = set(query_terms)
+
+        scored_docs = []
+        for i, doc in enumerate(docs):
+            if not isinstance(doc, str) or not doc.strip():
+                continue
+            # Distance is embedding similarity; lower is better
+            distance = float(distances[i]) if i < len(distances) else 10.0
+            doc_lower = doc.lower()
+            lexical_hits = 0
+            for term in query_term_set:
+                if term in doc_lower:
+                    lexical_hits += 1
+
+            # Higher score is better; semantic dominates, lexical breaks ties.
+            score = (-distance) + (0.15 * lexical_hits)
+            scored_docs.append((score, doc))
+
+        scored_docs.sort(key=lambda item: item[0], reverse=True)
+        top_docs = [doc for _, doc in scored_docs[:2]]
+        rag_context = "\n".join(top_docs)
     except Exception:
         rag_context = ""
 
     return {"rag_context": rag_context}
 
 
-def _needs_tool_call(transcript: str, tool_results: List[Dict]) -> bool:
-    """Simple heuristic to decide whether a tool call is needed."""
+def _parse_agent_json_output(output: str) -> dict:
+    """Parse strict JSON output from the agent.
 
-    if tool_results:
-        return False
+    Expected format:
+    {
+      "action": "tool" | "respond",
+      "tool_name": "...",
+      "arguments": {...},
+      "response": "..."
+    }
 
-    lowered = transcript.lower()
-    keywords = (
-        "solde",
-        "balance",
-        "compte",
-        "montant",
-        "echeance",
-        "echeancier",
-        "plan",
-        "paiement",
-        "payment",
-    )
-    return any(k in lowered for k in keywords)
+    Rules:
+    - If action="tool": tool_name and arguments required, response must be empty
+    - If action="respond": response required, tool_name must be null
+    - Invalid JSON falls back to safe "respond" action with fallback message
+    """
+    import json
+
+    try:
+        # Extract JSON from output (in case LLM adds extra text)
+        output = (output or "").strip()
+        if not output:
+            raise ValueError("Empty output")
+
+        # Try to find JSON object in output
+        start_idx = output.find("{")
+        end_idx = output.rfind("}")
+        if start_idx < 0:
+            raise ValueError("No JSON object found")
+
+        # If no closing brace, try to add one (handle truncation)
+        if end_idx < 0 or end_idx <= start_idx:
+            # Try to complete the JSON
+            json_str = output[start_idx:] + '"}'
+            try:
+                # Try parsing with completion
+                parsed = json.loads(json_str)
+            except:
+                # If that fails, just ensure we have valid structure
+                raise ValueError("Incomplete/invalid JSON")
+        else:
+            json_str = output[start_idx : end_idx + 1]
+            parsed = json.loads(json_str)
+
+        if not isinstance(parsed, dict):
+            raise ValueError("Parsed JSON is not an object")
+
+        # Validate and normalize
+        action = str(parsed.get("action", "")).strip().lower()
+        if action not in ("tool", "respond"):
+            raise ValueError(f"Invalid action: {action}")
+
+        if action == "tool":
+            tool_name = str(parsed.get("tool_name", "")).strip()
+            arguments = parsed.get("arguments", {})
+            if not tool_name:
+                raise ValueError("tool_name is required for action='tool'")
+            if not isinstance(arguments, dict):
+                arguments = {}
+            return {
+                "action": "tool",
+                "tool_name": tool_name,
+                "arguments": arguments,
+            }
+        else:  # action == "respond"
+            response = str(parsed.get("response", "")).strip()
+            if not response:
+                raise ValueError("response is required for action='respond'")
+            return {
+                "action": "respond",
+                "response": response,
+            }
+
+    except Exception as e:
+        # Safe fallback: respond with a polite message
+        return {
+            "action": "respond",
+            "response": "Je vais essayer de répondre à votre question. Pouvez-vous reformuler ou préciser votre demande?",
+        }
 
 
 def _agent_node(state: AgentState) -> AgentState:
-    """Reasoning node using the existing generate_ai_response function."""
+    """Pure LLM-driven agent node.
 
-    def parse_llm_output(text: str) -> dict:
-        """Parse optional tool instruction from LLM output.
+    The agent decides:
+    - Whether to call a tool (based on RAG context and task)
+    - What to respond (final answer)
 
-        Expected format: ACTION:tool NAME:xxx ARGS:{...}
-        Falls back to a direct response payload when parsing fails.
-        """
+    No business logic, no shortcuts, no keyword-based decisions.
+    All routing is LLM-driven through structured JSON output.
 
-        fallback = {"action": "respond", "message": (text or "").strip()}
-        try:
-            raw = (text or "").strip()
-            if not raw:
-                return fallback
-
-            one_line = " ".join(raw.replace("\n", " ").split())
-            action_pos = one_line.find("ACTION:")
-            name_label = "NAME:"
-            name_pos = one_line.find(name_label)
-            if name_pos < 0:
-                name_label = "NAME="
-                name_pos = one_line.find(name_label)
-
-            if action_pos < 0 or name_pos < 0:
-                return fallback
-            if not (action_pos < name_pos):
-                return fallback
-
-            action = one_line[action_pos + len("ACTION:") : name_pos].strip().lower()
-
-            # Accept both formats:
-            # 1) ACTION:tool NAME:xxx ARGS:{...}
-            # 2) ACTION:tool NAME:xxx<json_object>{...}
-            remainder = one_line[name_pos + len(name_label) :].strip()
-            args_label = "ARGS:"
-            args_pos = remainder.find(args_label)
-            if args_pos < 0:
-                args_label = "ARGS="
-                args_pos = remainder.find(args_label)
-            marker_pos = remainder.find("<json_object>")
-            brace_pos = remainder.find("{")
-
-            split_positions = [p for p in (args_pos, marker_pos, brace_pos) if p >= 0]
-            if split_positions:
-                cut = min(split_positions)
-                name = remainder[:cut].strip()
-            else:
-                name = remainder.strip()
-
-            if args_pos >= 0:
-                args_text = remainder[args_pos + len(args_label) :].strip()
-            elif marker_pos >= 0:
-                args_text = remainder[marker_pos + len("<json_object>") :].strip()
-            elif brace_pos >= 0:
-                args_text = remainder[brace_pos:].strip()
-            else:
-                args_text = ""
-
-            if action != "tool" or not name:
-                return fallback
-
-            import json
-
-            args: dict = {}
-            if args_text:
-                left = args_text.find("{")
-                right = args_text.rfind("}")
-                if left >= 0 and right > left:
-                    candidate = args_text[left : right + 1]
-                    try:
-                        parsed = json.loads(candidate)
-                        if isinstance(parsed, dict):
-                            args = parsed
-                    except Exception:
-                        # Keep the tool action even when ARGS is not strict JSON.
-                        args = {}
-
-            return {"action": "tool", "name": name, "args": args}
-        except Exception:
-            return fallback
+    The LLM is responsible for deciding whether to call a tool or respond.
+    """
 
     transcript = (state.get("transcript") or "").strip()
     rag_context = (state.get("rag_context") or "").strip()
     tool_results = state.get("tool_results") or []
 
-    tool_results_text = (
-        "\n".join(str(item) for item in tool_results) if tool_results else "none"
-    )
-    prompt = (
-        "You are a voice AI assistant with optional tools.\n"
-        "If a tool is required, output exactly one line in this format:\n"
-        "ACTION:tool NAME:<tool_name> ARGS:<json_object>\n"
-        "If no tool is required, output a direct user-facing answer only.\n\n"
-        "Context for this turn:\n"
-        f"TRANSCRIPT:\n{transcript or 'none'}\n\n"
-        f"RAG_CONTEXT:\n{rag_context or 'none'}\n\n"
-        f"TOOL_RESULTS:\n{tool_results_text}"
+    # Build tool results section for the prompt
+    if tool_results:
+        tool_results_lines = []
+        for result in tool_results:
+            tool_name = result.get("tool", "unknown")
+            status = "✓ success" if result.get("ok") else "✗ failed"
+            tool_results_lines.append(f"Tool: {tool_name} | Status: {status}")
+            # Add key parts of result
+            for key, value in result.items():
+                if key not in ("tool", "ok"):
+                    tool_results_lines.append(f"  {key}: {value}")
+        tool_results_text = "\n".join(tool_results_lines)
+    else:
+        tool_results_text = "[No tool results yet]"
+
+    # Construct the structured system prompt
+    system_prompt = (
+        """
+You are a strict decision-making AI agent for a banking system.
+
+Respond in French.
+
+You MUST choose ONLY ONE action:
+- "tool"
+- "respond"
+
+CRITICAL RULE (HIGHEST PRIORITY):
+If the user asks about ANY personal or account-related information
+(such as: solde, compte, paiement, crédit, échéance),
+you MUST call a tool.
+
+You are FORBIDDEN from answering these questions directly.
+
+---
+
+DECISION RULES:
+
+1) GREETING OR CASUAL:
+- Example: bonjour, salut
+→ action = "respond"
+
+2) GENERAL KNOWLEDGE (banking concepts):
+- Example: "c’est quoi une carte bancaire"
+→ action = "respond" (use RAG)
+
+If the provided RAG context contains relevant information that answers the question,
+you MUST answer using that context.
+Only ask a clarification question if the user's question is genuinely ambiguous OR
+the RAG context is empty / irrelevant.
+Do not say you don't know if the RAG context contains relevant information.
+
+3) USER-SPECIFIC DATA (VERY IMPORTANT):
+- Example: "mon solde", "mes paiements", "mon compte"
+→ action = "tool" (MANDATORY)
+
+DO NOT answer these yourself.
+
+---
+
+AVAILABLE TOOLS:
+- mock_account_lookup
+  arguments: {"query": "<user request>"}
+
+- mock_payment_plan
+  arguments: {"requested_installments": <number>}
+
+---
+
+OUTPUT FORMAT (STRICT JSON ONLY):
+
+If calling a tool:
+{
+  "action": "tool",
+  "tool_name": "...",
+  "arguments": {...}
+}
+
+If responding:
+{
+  "action": "respond",
+  "response": "..."
+}
+
+---
+
+STRICT CONSTRAINTS:
+- NEVER answer account-related questions directly
+- NEVER skip tool when required
+- NEVER output text outside JSON
+        """
     )
 
+    user_prompt = (
+        f"User question:\n{transcript}\n\n"
+        f"Banking documents (RAG context):\n{rag_context if rag_context else '[No relevant documents found]'}\n\n"
+        f"Previous tool executions:\n{tool_results_text}\n\n"
+    )
+
+    user_prompt += "Output JSON response:"
+
+    # Call LLM with structured prompt
+    prompt = f"{system_prompt}\n{user_prompt}"
     llm_output = (generate_ai_response(prompt) or "").strip()
-    parsed = parse_llm_output(llm_output)
+
+    # Parse JSON output strictly
+    parsed = _parse_agent_json_output(llm_output)
 
     if parsed.get("action") == "tool":
+        # Tool execution requested
         return {
             "tool_calls": [
                 {
-                    "name": parsed.get("name", ""),
-                    "args": parsed.get("args") or {},
+                    "name": parsed["tool_name"],
+                    "args": parsed.get("arguments", {}),
                 }
             ],
             "response_text": "",
         }
-
-    return {
-        "tool_calls": [],
-        "response_text": parsed.get("message", llm_output),
-    }
+    else:  # action == "respond"
+        # Final response
+        return {
+            "tool_calls": [],
+            "response_text": parsed.get("response", ""),
+        }
 
 
 def _mock_account_lookup(args: Dict) -> Dict:
@@ -343,39 +533,48 @@ def build_voice_agent_graph():
 
 
 def seed_chroma() -> None:
-    """Populate Chroma collection once with baseline French banking documents."""
+    """Seed Chroma from banque.pdf with chunking + Ollama embeddings."""
 
     collection = _get_chroma_collection()
 
-    # Avoid duplicates: seed only if collection is empty.
-    try:
-        if int(collection.count()) > 0:
-            return
-    except Exception:
+    project_root = Path(__file__).resolve().parents[1]
+    pdf_path = Path(os.environ.get("VOICE_AGENT_RAG_PDF", project_root / "banque.pdf"))
+    if not pdf_path.exists():
         return
 
-    documents = [
-        "Client en retard de paiement: proposer un echeancier adapte a sa capacite financiere.",
-        "En cas de retard superieur a 30 jours, presenter un plan de regularisation en plusieurs mensualites.",
-        "Si le client refuse de payer, envoyer une reclamation formelle avec les details de la dette.",
-        "Apres un refus explicite de paiement, informer le client des etapes officielles de recouvrement.",
-        "Client agressif: garder un ton calme, professionnel et factuel en toutes circonstances.",
-        "Face a des propos hostiles, ne pas repondre a l'agressivite et recentrer sur la solution de paiement.",
-        "Demande de solde: consulter le compte et communiquer uniquement les informations pertinentes.",
-        "Pour une demande de solde, verifier les echeances en retard avant de proposer un plan.",
-        "Negociation de delai: proposer entre 3 et 6 mensualites selon le montant impaye.",
-        "Si le client demande un report, proposer une premiere echeance proche et des mensualites realistes.",
-        "Procedure de relance: commencer par un rappel amiable avant la lettre de mise en demeure.",
-        "En absence de paiement apres relances, envoyer une lettre de mise en demeure conforme a la procedure.",
-        "Client cooperatif: confirmer le plan d'action, les dates et les montants convenus.",
-        "Quand le client accepte un echeancier, remercier et rappeler les prochaines etapes officielles.",
-        "Toujours conclure avec un resume clair de l'accord et des canaux de contact de la banque.",
+    source_key = str(pdf_path.resolve())
+
+    # Avoid duplicate ingestion for the same source.
+    try:
+        existing = collection.get(where={"source": source_key}, include=[])
+        if existing and existing.get("ids"):
+            return
+    except Exception:
+        pass
+
+    text = _extract_pdf_text(pdf_path)
+    if not text:
+        return
+
+    chunk_size = int(os.environ.get("VOICE_AGENT_RAG_CHUNK_SIZE", "900"))
+    chunk_overlap = int(os.environ.get("VOICE_AGENT_RAG_CHUNK_OVERLAP", "150"))
+    chunks = _chunk_text(text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    if not chunks:
+        return
+
+    ids = [f"banque_pdf_chunk_{i:05d}" for i in range(1, len(chunks) + 1)]
+    metadatas = [
+        {
+            "source": source_key,
+            "source_name": pdf_path.name,
+            "chunk_index": i,
+            "chunk_total": len(chunks),
+        }
+        for i in range(len(chunks))
     ]
 
-    ids = [f"fr_bank_doc_{i:03d}" for i in range(1, len(documents) + 1)]
-
     try:
-        collection.add(ids=ids, documents=documents)
+        collection.add(ids=ids, documents=chunks, metadatas=metadatas)
     except Exception:
         # Seeding must not block app startup.
         return
@@ -398,7 +597,7 @@ def run_voice_agent_turn(transcript: str) -> AgentState:
 
 
 if __name__ == "__main__":
-    result = run_voice_agent_turn("bonjour")
+    result = run_voice_agent_turn("quel est mon solde impayé ?")
 
     print("transcript:    ", result["transcript"])
     print("rag_context:   ", result["rag_context"])
