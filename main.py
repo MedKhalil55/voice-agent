@@ -28,7 +28,8 @@ from time import strftime
 
 from dotenv import load_dotenv
 
-from llm import generate_ai_response, stream_ai_response_sentences, warmup_llm
+from llm import stream_ai_response_sentences, warmup_llm
+from llm.langgraph_agent import run_voice_agent_prepare
 from stt import StreamingWhisper, warmup_stt
 from stt.streaming_whisper import VadConfig
 from tts import speak_streaming, warmup_tts
@@ -298,10 +299,34 @@ class VoiceAgent:
             first_audio_time = None
             full_response_parts = []
 
+            # Prepare context via LangGraph (decision + RAG + tools only).
+            state = run_voice_agent_prepare(user_text)
+            final_prompt = f"""
+Tu es un assistant bancaire.
+
+Règles:
+- réponse courte (max 2 phrases)
+- réponse directe
+- pas de politesse inutile
+- pas de questions
+- pas d'explication longue
+
+Question:
+{state["transcript"]}
+
+Contexte:
+{state["rag_context"][:800]}
+
+Résultat outil:
+{str(state["tool_results"])[:300]}
+
+Réponds uniquement avec l'information utile.
+""".strip()
+
             # Pause STT while responding to avoid echo.
             self._stt.pause()
             try:
-                for sentence in stream_ai_response_sentences(user_text):
+                for sentence in stream_ai_response_sentences(final_prompt):
                     sentence = (sentence or "").strip()
                     if not sentence:
                         continue
@@ -337,7 +362,9 @@ class VoiceAgent:
     def generate_response(self, user_text: str) -> str:
         """LLM boundary (kept as a method for easy future tool/RAG integration)."""
 
-        return generate_ai_response(user_text)
+        # Non-streaming path is intentionally not used for final responses.
+        # Keep this method for future integrations.
+        return ""
 
     def speak(self, text: str) -> None:
         """TTS boundary: streaming playback with no intermediate WAV files."""

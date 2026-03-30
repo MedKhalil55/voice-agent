@@ -185,10 +185,11 @@ def _parse_agent_json_output(output: str) -> dict:
       "response": "..."
     }
 
-    Rules:
-    - If action="tool": tool_name and arguments required, response must be empty
-    - If action="respond": response required, tool_name must be null
-    - Invalid JSON falls back to safe "respond" action with fallback message
+        Rules:
+        - If action="tool": tool_name and arguments required
+        - If action="respond": no final natural-language response is generated inside LangGraph
+            (response is optional and ignored)
+        - Invalid JSON falls back to safe "respond" action
     """
     import json
 
@@ -239,19 +240,16 @@ def _parse_agent_json_output(output: str) -> dict:
                 "arguments": arguments,
             }
         else:  # action == "respond"
-            response = str(parsed.get("response", "")).strip()
-            if not response:
-                raise ValueError("response is required for action='respond'")
+            # IMPORTANT: LangGraph must not generate final natural-language text.
+            # The streaming voice pipeline (main.py) will generate the final response.
             return {
                 "action": "respond",
-                "response": response,
             }
 
-    except Exception as e:
-        # Safe fallback: respond with a polite message
+    except Exception:
+        # Safe fallback: stop tool loop.
         return {
             "action": "respond",
-            "response": "Je vais essayer de répondre à votre question. Pouvez-vous reformuler ou préciser votre demande?",
         }
 
 
@@ -330,8 +328,9 @@ DECISION RULES (apply in order, stop at first match):
    "je ne peux pas payer tout".
    → action = "tool" using mock_payment_plan  ← MANDATORY
 
-5. After tool results exist in state → action = "respond" summarising 
-   results in French, do not call tools again.
+5. After tool results exist in state -> action = "respond" (STOP).
+    IMPORTANT: do NOT generate any natural-language response here.
+    The streaming voice pipeline will generate the final answer.
 ---
 
 AVAILABLE TOOLS:
@@ -354,8 +353,7 @@ If calling a tool:
 
 If responding:
 {
-  "action": "respond",
-  "response": "..."
+    "action": "respond"
 }
 
 ---
@@ -368,8 +366,7 @@ STRICT CONSTRAINTS:
 IMPORTANT:
 If tool results are present:
 - You MUST NOT call any tool
-- You MUST generate a final response using the tool results
-- Calling a tool again is strictly forbidden
+- Do NOT generate any final response text
 Your output MUST be valid JSON.
 Do not include any text before or after the JSON.
 Ensure the JSON is complete and properly closed.
@@ -408,10 +405,11 @@ Ensure the JSON is complete and properly closed.
             "response_text": "",
         }
     else:  # action == "respond"
-        # Final response
+        # IMPORTANT: LangGraph must NOT generate a final natural-language response.
+        # main.py will generate the final response in a streaming fashion.
         return {
             "tool_calls": [],
-            "response_text": parsed.get("response", ""),
+            "response_text": "",
         }
 
 
@@ -508,10 +506,10 @@ def _tool_executor_node(state: AgentState) -> AgentState:
 def _speak_node(state: AgentState) -> AgentState:
     """Finalize output state for downstream TTS playback."""
 
-    response_text = (state.get("response_text") or "").strip()
-    if response_text:
-        return {"response_text": response_text}
-    return {"response_text": "Je suis desole, je n'ai pas de reponse pour le moment."}
+    # IMPORTANT: LangGraph must not output a final natural-language response.
+    # Keep response_text as-is (typically empty). The streaming TTS pipeline
+    # generates spoken text in main.py.
+    return {"response_text": (state.get("response_text") or "").strip()}
 
 
 def _route_after_agent(state: AgentState) -> str:
@@ -611,6 +609,15 @@ def run_voice_agent_turn(transcript: str) -> AgentState:
         "response_text": "",
     }
     return _app.invoke(initial_state, config={"recursion_limit": 10})
+
+
+def run_voice_agent_prepare(transcript: str) -> dict:
+    state = run_voice_agent_turn(transcript)
+    return {
+        "transcript": state.get("transcript", ""),
+        "rag_context": state.get("rag_context", ""),
+        "tool_results": state.get("tool_results", []),
+    }
 
 
 if __name__ == "__main__":
