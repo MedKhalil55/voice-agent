@@ -388,8 +388,7 @@ def _get_chat_model():
 
     # Default stop tokens for voice UX: stop on double newline (paragraph break).
     if stop is None:
-      stop = ["\n\n", "<|im_end|>", "<|endoftext|>"]
-
+        stop = ["\n\n", "<|im_end|>", "<|endoftext|>"]
 
     return chat_ollama(
         model=model_name,
@@ -459,6 +458,53 @@ def _get_ollama_http():
     return _OLLAMA_HTTP
 
 
+def call_llm_raw(
+    messages: list[dict],
+    num_predict: int = 256,
+    temperature: float = 0.0,
+) -> str:
+    """Stateless Ollama call for orchestration layers.
+
+    - Does NOT use ConversationSession (no memory, no state).
+    - Does NOT inject this module's voice system prompt.
+    - Does NOT trim or post-process output.
+    - Uses non-streaming /api/chat (stream=False) so callers can parse full JSON.
+    """
+
+    model = _env("VOICE_AGENT_OLLAMA_MODEL", "qwen2.5:3b")
+    base_url = _env("VOICE_AGENT_OLLAMA_BASE_URL", "http://localhost:11434")
+    keep_alive = _env("VOICE_AGENT_OLLAMA_KEEP_ALIVE", "10m").strip() or None
+
+    if not isinstance(messages, list) or not messages:
+        return ""
+
+    options: dict = {
+        "num_predict": int(num_predict),
+        "temperature": float(temperature),
+    }
+
+    payload: dict = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": options,
+    }
+    if keep_alive:
+        payload["keep_alive"] = keep_alive
+
+    url = f"{base_url.rstrip('/')}/api/chat"
+    client = _get_ollama_http()
+
+    try:
+        resp = client.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        content = ((data or {}).get("message") or {}).get("content", "")
+        return (content or "").strip()
+    except Exception:
+        return ""
+
+
 def _stream_ollama_tokens(messages_raw: list[dict]):
     """Stream tokens from Ollama /api/chat, bypassing LangChain overhead."""
     # Model: default to a small local model for low TTFT.
@@ -489,7 +535,7 @@ def _stream_ollama_tokens(messages_raw: list[dict]):
             options[key] = val
 
     # num_predict: low cap reduces rambling and improves TTS latency.
-    options.setdefault("num_predict", 48)
+    options.setdefault("num_predict", 256)
     # temperature: low randomness for stable/professional voice responses.
     options.setdefault("temperature", 0.2)
     # top_p/top_k: keep decoding focused and coherent.
@@ -520,18 +566,17 @@ def _stream_ollama_tokens(messages_raw: list[dict]):
     url = f"{base_url.rstrip('/')}/api/chat"
     client = _get_ollama_http()
     import time
+
     _t0 = time.perf_counter()
     first_token = True
-
-
 
     with client.stream("POST", url, json=payload) as resp:
         resp.raise_for_status()
         for line in resp.iter_lines():
             # inside the for loop, at the top:
             if first_token:
-             print(f"[DIAG] Time to first token: {time.perf_counter() - _t0:.3f}s")
-             first_token = False
+                print(f"[DIAG] Time to first token: {time.perf_counter() - _t0:.3f}s")
+                first_token = False
 
             if not line:
                 continue
@@ -539,14 +584,16 @@ def _stream_ollama_tokens(messages_raw: list[dict]):
             token = data.get("message", {}).get("content", "")
             if token:
                 if first_token:
-                   print(f"[DIAG] TTFT: {time.perf_counter() - _t0:.3f}s")
-                   first_token = False
+                    print(f"[DIAG] TTFT: {time.perf_counter() - _t0:.3f}s")
+                    first_token = False
                 yield token
             if data.get("done", False):
                 # Log total generation time
-                print(f"[DIAG] Total gen: {time.perf_counter() - _t0:.3f}s | "
-                   f"prompt_eval: {data.get('prompt_eval_duration',0)/1e9:.3f}s | "
-                   f"eval: {data.get('eval_duration',0)/1e9:.3f}s")
+                print(
+                    f"[DIAG] Total gen: {time.perf_counter() - _t0:.3f}s | "
+                    f"prompt_eval: {data.get('prompt_eval_duration', 0) / 1e9:.3f}s | "
+                    f"eval: {data.get('eval_duration', 0) / 1e9:.3f}s"
+                )
                 break
 
 

@@ -15,10 +15,10 @@ from typing import Dict, List, TypedDict
 
 try:
     # Package mode: python -m llm.langgraph_agent
-    from llm.agent import generate_ai_response
+    from llm.agent import generate_ai_response, call_llm_raw
 except ModuleNotFoundError:
     # Script mode: uv run llm/langgraph_agent.py
-    from agent import generate_ai_response
+    from agent import generate_ai_response, call_llm_raw
 
 
 class AgentState(TypedDict):
@@ -288,8 +288,7 @@ def _agent_node(state: AgentState) -> AgentState:
         tool_results_text = "[No tool results yet]"
 
     # Construct the structured system prompt
-    system_prompt = (
-        """
+    system_prompt = """
 You are a strict decision-making AI agent for a banking system.
 
 Respond in French.
@@ -307,28 +306,32 @@ You are FORBIDDEN from answering these questions directly.
 
 ---
 
-DECISION RULES:
+DECISION RULES (apply in order, stop at first match):
 
-1) GREETING OR CASUAL:
-- Example: bonjour, salut
-→ action = "respond"
+1. GREETING / CASUAL (bonjour, salut, merci, au revoir)
+   → action = "respond"
 
-2) GENERAL KNOWLEDGE (banking concepts):
-- Example: "c’est quoi une carte bancaire"
-→ action = "respond" (use RAG)
+2. GENERAL BANKING KNOWLEDGE — questions about concepts, definitions, 
+   procedures, documents, regulations from the banking document.
+   Key signal: question uses "quels sont", "qu'est-ce que", "comment", 
+   "pourquoi", "c'est quoi", or has NO personal possessive pronoun 
+   (mon/ma/mes/votre/vos).
+   → action = "respond", answer using RAG context if available.
+   NEVER call a tool for general knowledge questions.
 
-If the provided RAG context contains relevant information that answers the question,
-you MUST answer using that context.
-Only ask a clarification question if the user's question is genuinely ambiguous OR
-the RAG context is empty / irrelevant.
-Do not say you don't know if the RAG context contains relevant information.
+3. USER-SPECIFIC PERSONAL DATA — question is about THIS user's own account.
+   Key signal: contains "mon solde", "mon compte", "mes paiements", 
+   "mon impayé", "ma situation", "combien je dois", or any possessive 
+   pronoun referring to the caller's own data.
+   → action = "tool" using mock_account_lookup  ← MANDATORY
 
-3) USER-SPECIFIC DATA (VERY IMPORTANT):
-- Example: "mon solde", "mes paiements", "mon compte"
-→ action = "tool" (MANDATORY)
+4. PAYMENT PLAN REQUEST from the caller personally.
+   Key signal: "je veux payer en X fois", "proposez-moi un échéancier",
+   "je ne peux pas payer tout".
+   → action = "tool" using mock_payment_plan  ← MANDATORY
 
-DO NOT answer these yourself.
-
+5. After tool results exist in state → action = "respond" summarising 
+   results in French, do not call tools again.
 ---
 
 AVAILABLE TOOLS:
@@ -361,8 +364,16 @@ STRICT CONSTRAINTS:
 - NEVER answer account-related questions directly
 - NEVER skip tool when required
 - NEVER output text outside JSON
+
+IMPORTANT:
+If tool results are present:
+- You MUST NOT call any tool
+- You MUST generate a final response using the tool results
+- Calling a tool again is strictly forbidden
+Your output MUST be valid JSON.
+Do not include any text before or after the JSON.
+Ensure the JSON is complete and properly closed.
         """
-    )
 
     user_prompt = (
         f"User question:\n{transcript}\n\n"
@@ -372,9 +383,15 @@ STRICT CONSTRAINTS:
 
     user_prompt += "Output JSON response:"
 
-    # Call LLM with structured prompt
-    prompt = f"{system_prompt}\n{user_prompt}"
-    llm_output = (generate_ai_response(prompt) or "").strip()
+    # Call LLM statelessly (no ConversationSession, no extra system prompt).
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    llm_output = (
+        call_llm_raw(messages, num_predict=256, temperature=0.0) or ""
+    ).strip()
+    print(f"[AGENT RAW OUTPUT] {llm_output!r}")
 
     # Parse JSON output strictly
     parsed = _parse_agent_json_output(llm_output)
@@ -597,7 +614,7 @@ def run_voice_agent_turn(transcript: str) -> AgentState:
 
 
 if __name__ == "__main__":
-    result = run_voice_agent_turn("quel est mon solde impayé ?")
+    result = run_voice_agent_turn(" quel sont les avantages du virement? ")
 
     print("transcript:    ", result["transcript"])
     print("rag_context:   ", result["rag_context"])
