@@ -137,7 +137,7 @@ def _retrieve_node(state: AgentState) -> AgentState:
         collection = _get_chroma_collection()
         result = collection.query(
             query_texts=[transcript],
-            n_results=5,
+            n_results=8,
             include=["documents", "distances"],
         )
         docs = (result.get("documents") or [[]])[0]
@@ -166,7 +166,7 @@ def _retrieve_node(state: AgentState) -> AgentState:
             scored_docs.append((score, doc))
 
         scored_docs.sort(key=lambda item: item[0], reverse=True)
-        top_docs = [doc for _, doc in scored_docs[:2]]
+        top_docs = [doc for _, doc in scored_docs[:3]]
         rag_context = "\n".join(top_docs)
     except Exception:
         rag_context = ""
@@ -270,6 +270,20 @@ def _agent_node(state: AgentState) -> AgentState:
     rag_context = (state.get("rag_context") or "").strip()
     tool_results = state.get("tool_results") or []
 
+    # Construct the structured system prompt
+    system_prompt = """
+You are a banking agent router. Respond ONLY in JSON.
+
+RULES:
+1. Greeting/casual -> {"action": "respond"}
+2. General banking question (no possessive pronoun) -> {"action": "respond"}
+3. Personal account data (mon/ma/mes/solde/compte) -> {"action": "tool", "tool_name": "mock_account_lookup", "arguments": {"query": "<transcript>"}}
+4. Payment plan request -> {"action": "tool", "tool_name": "mock_payment_plan", "arguments": {"requested_installments": <n>}}
+5. Tool results already present -> {"action": "respond"}
+
+Output ONLY valid JSON. No text outside JSON.
+    """
+
     # Build tool results section for the prompt
     if tool_results:
         tool_results_lines = []
@@ -285,93 +299,6 @@ def _agent_node(state: AgentState) -> AgentState:
     else:
         tool_results_text = "[No tool results yet]"
 
-    # Construct the structured system prompt
-    system_prompt = """
-You are a strict decision-making AI agent for a banking system.
-
-Respond in French.
-
-You MUST choose ONLY ONE action:
-- "tool"
-- "respond"
-
-CRITICAL RULE (HIGHEST PRIORITY):
-If the user asks about ANY personal or account-related information
-(such as: solde, compte, paiement, crédit, échéance),
-you MUST call a tool.
-
-You are FORBIDDEN from answering these questions directly.
-
----
-
-DECISION RULES (apply in order, stop at first match):
-
-1. GREETING / CASUAL (bonjour, salut, merci, au revoir)
-   → action = "respond"
-
-2. GENERAL BANKING KNOWLEDGE — questions about concepts, definitions, 
-   procedures, documents, regulations from the banking document.
-   Key signal: question uses "quels sont", "qu'est-ce que", "comment", 
-   "pourquoi", "c'est quoi", or has NO personal possessive pronoun 
-   (mon/ma/mes/votre/vos).
-   → action = "respond", answer using RAG context if available.
-   NEVER call a tool for general knowledge questions.
-
-3. USER-SPECIFIC PERSONAL DATA — question is about THIS user's own account.
-   Key signal: contains "mon solde", "mon compte", "mes paiements", 
-   "mon impayé", "ma situation", "combien je dois", or any possessive 
-   pronoun referring to the caller's own data.
-   → action = "tool" using mock_account_lookup  ← MANDATORY
-
-4. PAYMENT PLAN REQUEST from the caller personally.
-   Key signal: "je veux payer en X fois", "proposez-moi un échéancier",
-   "je ne peux pas payer tout".
-   → action = "tool" using mock_payment_plan  ← MANDATORY
-
-5. After tool results exist in state -> action = "respond" (STOP).
-    IMPORTANT: do NOT generate any natural-language response here.
-    The streaming voice pipeline will generate the final answer.
----
-
-AVAILABLE TOOLS:
-- mock_account_lookup
-  arguments: {"query": "<user request>"}
-
-- mock_payment_plan
-  arguments: {"requested_installments": <number>}
-
----
-
-OUTPUT FORMAT (STRICT JSON ONLY):
-
-If calling a tool:
-{
-  "action": "tool",
-  "tool_name": "...",
-  "arguments": {...}
-}
-
-If responding:
-{
-    "action": "respond"
-}
-
----
-
-STRICT CONSTRAINTS:
-- NEVER answer account-related questions directly
-- NEVER skip tool when required
-- NEVER output text outside JSON
-
-IMPORTANT:
-If tool results are present:
-- You MUST NOT call any tool
-- Do NOT generate any final response text
-Your output MUST be valid JSON.
-Do not include any text before or after the JSON.
-Ensure the JSON is complete and properly closed.
-        """
-
     user_prompt = (
         f"User question:\n{transcript}\n\n"
         f"Banking documents (RAG context):\n{rag_context if rag_context else '[No relevant documents found]'}\n\n"
@@ -385,9 +312,7 @@ Ensure the JSON is complete and properly closed.
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    llm_output = (
-        call_llm_raw(messages, num_predict=256, temperature=0.0) or ""
-    ).strip()
+    llm_output = (call_llm_raw(messages, num_predict=32, temperature=0.0) or "").strip()
     print(f"[AGENT RAW OUTPUT] {llm_output!r}")
 
     # Parse JSON output strictly

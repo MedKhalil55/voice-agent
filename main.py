@@ -28,7 +28,7 @@ from time import strftime
 
 from dotenv import load_dotenv
 
-from llm import stream_ai_response_sentences, warmup_llm
+from llm import stream_raw_sentences, warmup_llm
 from llm.langgraph_agent import run_voice_agent_prepare
 from stt import StreamingWhisper, warmup_stt
 from stt.streaming_whisper import VadConfig
@@ -202,6 +202,7 @@ class VoiceAgent:
             "no",
             "off",
         }
+
         if warmup_enabled:
 
             def _warmup_stt_safe() -> None:
@@ -301,32 +302,37 @@ class VoiceAgent:
 
             # Prepare context via LangGraph (decision + RAG + tools only).
             state = run_voice_agent_prepare(user_text)
-            final_prompt = f"""
-Tu es un assistant bancaire.
+            print(f"[RAG DEBUG] rag_context: {repr(state.get('rag_context', '')[:300])}")
 
-Règles:
-- réponse courte (max 2 phrases)
-- réponse directe
-- pas de politesse inutile
-- pas de questions
-- pas d'explication longue
 
-Question:
-{state["transcript"]}
+            system_msg = (
+                "Tu es un assistant bancaire strict. "
+                "RÈGLE ABSOLUE: utilise UNIQUEMENT le texte du CONTEXTE fourni pour répondre. "
+                "Si la réponse n'est pas dans le contexte, dis 'Je n'ai pas cette information'. "
+                "Ne jamais utiliser tes connaissances générales. "
+                "Réponse en 1-2 phrases courtes."
+            )
 
-Contexte:
-{state["rag_context"][:800]}
+            rag = (state.get("rag_context") or "").strip()
+            tool_res = state.get("tool_results") or []
 
-Résultat outil:
-{str(state["tool_results"])[:300]}
+            if tool_res:
+                user_msg = (
+                    f"Question: {state['transcript']}\n\n"
+                    f"Résultat outil: {str(tool_res)[:300]}\n\nRéponse:"
+                )
+            else:
+                user_msg = (
+                    f"Question: {state['transcript']}\n\n"
+                    f"CONTEXTE:\n{rag[:800]}\n\n"
+                    "Réponse basée UNIQUEMENT sur le CONTEXTE ci-dessus:"
+                )
 
-Réponds uniquement avec l'information utile.
-""".strip()
-
-            # Pause STT while responding to avoid echo.
             self._stt.pause()
             try:
-                for sentence in stream_ai_response_sentences(final_prompt):
+                for sentence in stream_raw_sentences(
+                    user_msg, system_content=system_msg
+                ):
                     sentence = (sentence or "").strip()
                     if not sentence:
                         continue

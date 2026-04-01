@@ -34,7 +34,7 @@ from functools import lru_cache
 from typing import Deque, List, Tuple
 
 _SENTENCE_END_RE = re.compile(r"[.!?]")
-_SENTENCE_SPLIT_RE = re.compile(r"[.!?]\s")
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?](?:\s|$)")
 
 
 def _trim_to_last_sentence(text: str) -> str:
@@ -711,3 +711,72 @@ def stream_ai_response_sentences(user_text: str):
         if not full_response.strip():
             yield final
         session.append_turn(text, final)
+
+
+def stream_raw_sentences(user_content: str, system_content: str = ""):
+    text = (user_content or "").strip()
+    if not text:
+        return
+    messages = []
+    if system_content:
+        messages.append({"role": "system", "content": system_content})
+    messages.append({"role": "user", "content": text})
+
+    buffer = ""
+    _MAX_BUFFER = 200  # Force-yield at a word boundary if no punctuation found
+
+    try:
+        for token in _stream_ollama_tokens(messages):
+            buffer += token
+
+            # Extract complete sentences from the buffer.
+            while True:
+                match = _SENTENCE_SPLIT_RE.search(buffer)
+                if match:
+                    end = match.start() + 1  # include punctuation, not trailing space
+                    sentence = buffer[:end].strip()
+                    buffer = buffer[end:].lstrip()
+                    if sentence:
+                        yield sentence
+                    continue
+
+                if len(buffer) > _MAX_BUFFER:
+                    # Force-yield without cutting mid-word. Keep the remainder.
+                    cut = buffer.rfind(" ")
+                    if cut > 0:
+                        forced = buffer[:cut].strip()
+                        buffer = buffer[cut:].lstrip()
+                    else:
+                        forced = buffer.strip()
+                        buffer = ""
+                    if forced:
+                        yield forced
+                break
+
+        # Flush remaining text. Prefer a complete sentence; otherwise yield
+        # the remaining fragment so TTS doesn't get stuck with no output.
+        remaining = buffer.strip()
+        if remaining:
+            last_end = -1
+            for match in _SENTENCE_END_RE.finditer(remaining):
+                last_end = match.end()
+            if last_end > 0:
+                tail_sentence = remaining[:last_end].strip()
+                if tail_sentence:
+                    yield tail_sentence
+            else:
+                yield remaining
+
+    except Exception:
+        # Best-effort: flush a complete sentence if possible.
+        remaining = buffer.strip()
+        if remaining:
+            last_end = -1
+            for match in _SENTENCE_END_RE.finditer(remaining):
+                last_end = match.end()
+            if last_end > 0:
+                tail_sentence = remaining[:last_end].strip()
+                if tail_sentence:
+                    yield tail_sentence
+            else:
+                yield remaining
