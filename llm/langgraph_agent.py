@@ -23,10 +23,13 @@ except ModuleNotFoundError:
 
 class AgentState(TypedDict):
     transcript: str
+    route: str | None
     rag_context: str
     tool_calls: List[Dict]
     tool_results: List[Dict]
     response_text: str
+    agent_iterations: int
+    tool_call_count: int
 
 
 def _get_chroma_collection():
@@ -133,6 +136,14 @@ def _retrieve_node(state: AgentState) -> AgentState:
     if not transcript:
         return {"rag_context": ""}
 
+    route = state.get("route")
+    if route is None:
+        route = _fast_route(transcript, [])
+
+    # Optimization: avoid RAG latency unless we explicitly need RAG.
+    if route != "rag":
+        return {"rag_context": ""}
+
     try:
         collection = _get_chroma_collection()
         result = collection.query(
@@ -205,16 +216,13 @@ def _parse_agent_json_output(output: str) -> dict:
         if start_idx < 0:
             raise ValueError("No JSON object found")
 
-        # If no closing brace, try to add one (handle truncation)
+        # If no closing brace, try to add missing braces (handle truncation)
         if end_idx < 0 or end_idx <= start_idx:
-            # Try to complete the JSON
-            json_str = output[start_idx:] + '"}'
-            try:
-                # Try parsing with completion
-                parsed = json.loads(json_str)
-            except:
-                # If that fails, just ensure we have valid structure
-                raise ValueError("Incomplete/invalid JSON")
+            json_str = output[start_idx:]
+            missing = json_str.count("{") - json_str.count("}")
+            if missing > 0:
+                json_str += "}" * missing
+            parsed = json.loads(json_str)
         else:
             json_str = output[start_idx : end_idx + 1]
             parsed = json.loads(json_str)
@@ -224,7 +232,7 @@ def _parse_agent_json_output(output: str) -> dict:
 
         # Validate and normalize
         action = str(parsed.get("action", "")).strip().lower()
-        if action not in ("tool", "respond"):
+        if action not in ("tool", "respond", "rag"):
             raise ValueError(f"Invalid action: {action}")
 
         if action == "tool":
@@ -239,6 +247,10 @@ def _parse_agent_json_output(output: str) -> dict:
                 "tool_name": tool_name,
                 "arguments": arguments,
             }
+        elif action == "rag":
+            return {
+                "action": "rag",
+            }
         else:  # action == "respond"
             # IMPORTANT: LangGraph must not generate final natural-language text.
             # The streaming voice pipeline (main.py) will generate the final response.
@@ -251,6 +263,51 @@ def _parse_agent_json_output(output: str) -> dict:
         return {
             "action": "respond",
         }
+
+
+def _fast_route(transcript: str, tool_results: list) -> str | None:
+    if tool_results:
+        return None
+
+    import re
+
+    t = " ".join(transcript.lower().split())
+    t = re.sub(r"[\s\.,;:!?…]+$", "", t)
+
+    # strict casual
+    casual = ("bonjour", "bonsoir", "salut", "merci", "ok", "d'accord")
+    if any(c in t for c in casual):
+        return "respond"
+
+    # account intent
+    account_signals = (
+        "solde",
+        "compte",
+        "dette",
+        "impayé",
+        "sol",
+        "camp",
+        "mon camp",
+    )
+    if any(s in t for s in account_signals):
+        return "account"
+
+    # payment intent
+    payment_signals = (
+        "mensualité",
+        "échéancier",
+        "payer en",
+        "plan de paiement",
+        "paiement",
+    )
+    if any(s in t for s in payment_signals):
+        return "payment"
+
+    # knowledge intent
+    if any(s in t for s in ("qu'est-ce que", "qu'est-ce qu", "définition", "explique")):
+        return "rag"
+
+    return None
 
 
 def _agent_node(state: AgentState) -> AgentState:
@@ -269,19 +326,87 @@ def _agent_node(state: AgentState) -> AgentState:
     transcript = (state.get("transcript") or "").strip()
     rag_context = (state.get("rag_context") or "").strip()
     tool_results = state.get("tool_results") or []
+    agent_iterations = int(state.get("agent_iterations") or 0) + 1
+    tool_call_count = int(state.get("tool_call_count") or 0)
+
+    fast = _fast_route(transcript, tool_results)
+
+    if fast == "respond":
+        return {
+            "agent_iterations": agent_iterations,
+            "tool_calls": [],
+            "response_text": "",
+        }
+
+    if fast == "account":
+        return {
+            "agent_iterations": agent_iterations,
+            "tool_calls": [
+                {"name": "mock_account_lookup", "args": {"query": transcript}}
+            ],
+            "response_text": "",
+        }
+
+    if fast == "payment":
+        import re
+
+        nums = re.findall(r"\d+", transcript)
+        n = int(nums[0]) if nums else 3
+        return {
+            "agent_iterations": agent_iterations,
+            "tool_calls": [
+                {"name": "mock_payment_plan", "args": {"requested_installments": n}}
+            ],
+            "response_text": "",
+        }
+
+    if fast == "rag":
+        return {
+            "agent_iterations": agent_iterations,
+            "tool_calls": [],
+            "response_text": "",
+        }
+
+    # Hard safety rails (graph-level): never loop tools.
+    # - If a tool already ran once, force respond.
+    # - Cap agent node executions at 2 (agent -> tool_executor -> agent).
+    if tool_call_count >= 1 or agent_iterations >= 2:
+        return {
+            "agent_iterations": agent_iterations,
+            "tool_calls": [],
+            "response_text": "",
+        }
 
     # Construct the structured system prompt
     system_prompt = """
-You are a banking agent router. Respond ONLY in JSON.
+    CRITICAL:
+- Output MUST be ONLY valid JSON
+- Do NOT add any text before or after
+- Do NOT write "respond:" or anything else
+You are a banking intent router. Output ONLY a single-line JSON object (must start with '{' and end with '}').
 
-RULES:
-1. Greeting/casual -> {"action": "respond"}
-2. General banking question (no possessive pronoun) -> {"action": "respond"}
-3. Personal account data (mon/ma/mes/solde/compte) -> {"action": "tool", "tool_name": "mock_account_lookup", "arguments": {"query": "<transcript>"}}
-4. Payment plan request -> {"action": "tool", "tool_name": "mock_payment_plan", "arguments": {"requested_installments": <n>}}
-5. Tool results already present -> {"action": "respond"}
+HIGHEST PRIORITY RULE:
+- If the user message is a greeting or small talk (e.g., bonjour, salut, hello, merci, ok, au revoir), ALWAYS choose respond.
+- For greetings/small talk: NEVER choose tool, NEVER choose rag.
 
-Output ONLY valid JSON. No text outside JSON.
+Choose ONLY ONE action:
+- respond: greetings / small talk / general explanation not needing personal account data.
+- tool: ONLY for personal/account data.
+    Trigger tool if the question is about THE USER'S account using possessives (mon/ma/mes) or mentions account data like: solde, compte, paiements, transaction(s), relevé.
+- rag: ONLY for banking concepts/definitions/general knowledge answered from documents.
+
+Tool constraints:
+- NEVER call multiple tools.
+- If unsure: {"action":"respond"}
+
+Output format (single line):
+- respond: {"action":"respond"}
+- rag: {"action":"rag"}
+- tool: {"action":"tool","tool_name":"mock_account_lookup","arguments":{"query":"<transcript>"}}
+    or {"action":"tool","tool_name":"mock_payment_plan","arguments":{"requested_installments":3}}
+
+Extra examples:
+User: Quel est mon solde ? -> {"action":"tool","tool_name":"mock_account_lookup","arguments":{"query":"<transcript>"}}
     """
 
     # Build tool results section for the prompt
@@ -318,9 +443,11 @@ Output ONLY valid JSON. No text outside JSON.
     # Parse JSON output strictly
     parsed = _parse_agent_json_output(llm_output)
 
-    if parsed.get("action") == "tool":
+    action = parsed.get("action")
+    if action == "tool":
         # Tool execution requested
         return {
+            "agent_iterations": agent_iterations,
             "tool_calls": [
                 {
                     "name": parsed["tool_name"],
@@ -329,10 +456,11 @@ Output ONLY valid JSON. No text outside JSON.
             ],
             "response_text": "",
         }
-    else:  # action == "respond"
+    else:  # action == "respond" or action == "rag"
         # IMPORTANT: LangGraph must NOT generate a final natural-language response.
         # main.py will generate the final response in a streaming fashion.
         return {
+            "agent_iterations": agent_iterations,
             "tool_calls": [],
             "response_text": "",
         }
@@ -365,7 +493,10 @@ def _tool_executor_node(state: AgentState) -> AgentState:
 
     tool_calls = state.get("tool_calls") or []
     if not tool_calls:
-        return {"tool_results": []}
+        return {
+            "tool_results": [],
+            "tool_call_count": int(state.get("tool_call_count") or 0),
+        }
 
     tools = {
         "mock_account_lookup": _mock_account_lookup,
@@ -425,6 +556,7 @@ def _tool_executor_node(state: AgentState) -> AgentState:
     return {
         "tool_calls": [],
         "tool_results": results,
+        "tool_call_count": int(state.get("tool_call_count") or 0) + 1,
     }
 
 
@@ -440,6 +572,10 @@ def _speak_node(state: AgentState) -> AgentState:
 def _route_after_agent(state: AgentState) -> str:
     """Route to tool execution when tools are requested; otherwise finish."""
 
+    if int(state.get("tool_call_count") or 0) >= 1:
+        return "done"
+    if int(state.get("agent_iterations") or 0) >= 2:
+        return "done"
     return "tool" if (state.get("tool_calls") or []) else "done"
 
 
@@ -528,10 +664,13 @@ seed_chroma()
 def run_voice_agent_turn(transcript: str) -> AgentState:
     initial_state: AgentState = {
         "transcript": transcript,
+        "route": _fast_route(transcript, []),
         "rag_context": "",
         "tool_calls": [],
         "tool_results": [],
         "response_text": "",
+        "agent_iterations": 0,
+        "tool_call_count": 0,
     }
     return _app.invoke(initial_state, config={"recursion_limit": 10})
 
@@ -542,6 +681,7 @@ def run_voice_agent_prepare(transcript: str) -> dict:
         "transcript": state.get("transcript", ""),
         "rag_context": state.get("rag_context", ""),
         "tool_results": state.get("tool_results", []),
+        "route": state.get("route"),
     }
 
 

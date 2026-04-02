@@ -302,31 +302,65 @@ class VoiceAgent:
 
             # Prepare context via LangGraph (decision + RAG + tools only).
             state = run_voice_agent_prepare(user_text)
-            print(f"[RAG DEBUG] rag_context: {repr(state.get('rag_context', '')[:300])}")
-
-
-            system_msg = (
-                "Tu es un assistant bancaire strict. "
-                "RÈGLE ABSOLUE: utilise UNIQUEMENT le texte du CONTEXTE fourni pour répondre. "
-                "Si la réponse n'est pas dans le contexte, dis 'Je n'ai pas cette information'. "
-                "Ne jamais utiliser tes connaissances générales. "
-                "Réponse en 1-2 phrases courtes."
+            print(
+                f"[RAG DEBUG] rag_context: {repr(state.get('rag_context', '')[:300])}"
             )
 
             rag = (state.get("rag_context") or "").strip()
             tool_res = state.get("tool_results") or []
+            route = state.get("route")
 
-            if tool_res:
-                user_msg = (
-                    f"Question: {state['transcript']}\n\n"
-                    f"Résultat outil: {str(tool_res)[:300]}\n\nRéponse:"
+            is_casual = (route == "respond") and not tool_res
+
+            if is_casual:
+                rag = ""  # prevent RAG pollution for casual messages
+                system_msg = (
+    "Tu es un assistant bancaire humain et chaleureux.\n\n"
+    "RÈGLES:\n"
+    "- Si le client dit bonjour → réponds bonjour naturellement\n"
+    "- Si le client dit merci → réponds avec plaisir\n"
+    "- Ne JAMAIS dire 'Je n'ai pas cette information' pour du small talk\n"
+    "- Réponds comme un humain, pas comme un robot\n"
+    "- 1 phrase courte\n\n"
+    "Exemples:\n"
+    "Client: Bonjour\n"
+    "Assistant: Bonjour ! Comment puis-je vous aider aujourd'hui ?\n\n"
+    "Client: Merci\n"
+    "Assistant: Avec plaisir !"
+)
+                user_msg = f"Client: {state['transcript']}\nAssistant:"
+
+            elif tool_res:
+                system_msg = (
+                    "Tu es un assistant bancaire.\n"
+                    "Ta mission: transformer les données JSON en réponse naturelle.\n\n"
+                    "RÈGLES:\n"
+                    "- Ne JAMAIS afficher du JSON\n"
+                    "- Ne JAMAIS afficher de structure technique\n"
+                    "- Répondre comme un humain\n"
+                    "- 1 à 2 phrases maximum\n"
+                    "- Être clair et professionnel\n\n"
+                    "EXEMPLE:\n"
+                    "input: {'outstanding_amount': 2450.0}\n"
+                    "output: Votre montant dû est de 2450 dinars."
                 )
+
+                user_msg = (
+                    f"Question client: {state['transcript']}\n\n"
+                    f"Données outil:\n{tool_res}\n\n"
+                    "Réponse naturelle:"
+                )
+
             else:
-                user_msg = (
-                    f"Question: {state['transcript']}\n\n"
-                    f"CONTEXTE:\n{rag[:800]}\n\n"
-                    "Réponse basée UNIQUEMENT sur le CONTEXTE ci-dessus:"
+                system_msg = (
+                    "Tu es un assistant bancaire strict.\n"
+                    "Tu dois répondre UNIQUEMENT avec le CONTEXTE fourni.\n\n"
+                    "RÈGLES:\n"
+                    "- Si la réponse n'est pas dans le contexte → dis 'Je n'ai pas cette information'\n"
+                    "- Ne jamais inventer\n"
+                    "- Réponse courte (1-2 phrases)"
                 )
+                user_msg = f"{state['transcript']} CONTEXTE: {rag[:500]}"
 
             self._stt.pause()
             try:
