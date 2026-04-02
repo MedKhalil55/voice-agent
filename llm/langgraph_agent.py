@@ -136,12 +136,14 @@ def _retrieve_node(state: AgentState) -> AgentState:
     if not transcript:
         return {"rag_context": ""}
 
+    # Reuse precomputed route when present to avoid a second LLM classification.
     route = state.get("route")
     if route is None:
-        route = _fast_route(transcript, [])
+        intent = _classify_intent(transcript, [])
+        route = intent["primary"]
 
     # Optimization: avoid RAG latency unless we explicitly need RAG.
-    if route != "rag":
+    if route not in ("rag",):
         return {"rag_context": ""}
 
     try:
@@ -265,49 +267,151 @@ def _parse_agent_json_output(output: str) -> dict:
         }
 
 
-def _fast_route(transcript: str, tool_results: list) -> str | None:
-    if tool_results:
-        return None
-
+def _classify_intent(transcript: str, tool_results: list) -> dict:
+    import json
     import re
 
-    t = " ".join(transcript.lower().split())
+    default = {
+        "primary": "general",
+        "tool_name": None,
+        "secondary": None,
+    }
+
+    if tool_results:
+        return {
+            "primary": "respond",
+            "tool_name": None,
+            "secondary": None,
+        }
+
+    t = " ".join((transcript or "").lower().split())
     t = re.sub(r"[\s\.,;:!?…]+$", "", t)
 
-    # strict casual
-    casual = ("bonjour", "bonsoir", "salut", "merci", "ok", "d'accord")
-    if any(c in t for c in casual):
-        return "respond"
-
-    # account intent
-    account_signals = (
-        "solde",
-        "compte",
-        "dette",
-        "impayé",
-        "sol",
-        "camp",
-        "mon camp",
+    casual_only = (
+        "bonjour",
+        "bonsoir",
+        "salut",
+        "merci",
+        "ok",
+        "d'accord",
+        "au revoir",
     )
-    if any(s in t for s in account_signals):
-        return "account"
+    if t in casual_only:
+        return {
+            "primary": "casual",
+            "tool_name": None,
+            "secondary": None,
+        }
 
-    # payment intent
-    payment_signals = (
-        "mensualité",
-        "échéancier",
-        "payer en",
-        "plan de paiement",
-        "paiement",
-    )
-    if any(s in t for s in payment_signals):
-        return "payment"
+    INTENT_CLASSIFIER_SYSTEM = """You are a banking intent classifier. Output ONLY one line of valid JSON, nothing else.
 
-    # knowledge intent
-    if any(s in t for s in ("qu'est-ce que", "qu'est-ce qu", "définition", "explique")):
-        return "rag"
+Classify the user message into exactly one primary intent:
+- "casual": pure greeting or small talk only (bonjour, merci, ok, au revoir, bonsoir)
+- "tool": user asks about THEIR personal account data (mon solde, mon compte, mes paiements, impayé, mon échéancier, mes transactions) — even if combined with a greeting
+- "rag": user asks about banking concepts, product definitions, general banking rules (qu'est-ce que, comment fonctionne, définition, avantages de)
+- "general": any other banking or financial question the LLM can answer from knowledge
 
-    return None
+For "tool", also detect which tool: "mock_account_lookup" for balance/account/arrears, "mock_payment_plan" for payment plans/installments.
+If message mixes greeting + tool intent, set primary="tool" and secondary="casual".
+
+Output format (single line JSON only):
+{"primary":"tool","tool_name":"mock_account_lookup","secondary":"casual"}
+{"primary":"casual","tool_name":null,"secondary":null}
+{"primary":"general","tool_name":null,"secondary":null}
+{"primary":"rag","tool_name":null,"secondary":null}
+
+Examples:
+"Bonjour" → {"primary":"casual","tool_name":null,"secondary":null}
+"Quel est mon solde?" → {"primary":"tool","tool_name":"mock_account_lookup","secondary":null}
+"Bonjour, quel est mon solde?" → {"primary":"tool","tool_name":"mock_account_lookup","secondary":"casual"}
+"Comment fonctionne un virement?" → {"primary":"rag","tool_name":null,"secondary":null}
+"C'est quoi un taux d'intérêt?" → {"primary":"general","tool_name":null,"secondary":null}
+"Je veux payer en 3 fois" → {"primary":"tool","tool_name":"mock_payment_plan","secondary":null}
+"""
+
+    user_prompt = f"User message: {transcript}\nReturn JSON only."
+
+    raw = (
+        call_llm_raw(
+            [
+                {"role": "system", "content": INTENT_CLASSIFIER_SYSTEM},
+                {"role": "user", "content": user_prompt},
+            ],
+            num_predict=48,
+            temperature=0.0,
+        )
+        or ""
+    ).strip()
+
+    try:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end < start:
+            raise ValueError("No JSON object")
+        parsed = json.loads(raw[start : end + 1])
+        if not isinstance(parsed, dict):
+            raise ValueError("JSON is not an object")
+
+        primary = str(parsed.get("primary", "")).strip().lower()
+        if primary not in ("tool", "rag", "general", "casual"):
+            raise ValueError("Invalid primary")
+
+        tool_name = parsed.get("tool_name")
+        if tool_name not in ("mock_account_lookup", "mock_payment_plan", None):
+            tool_name = None
+
+        secondary = parsed.get("secondary")
+        if secondary is None:
+            secondary = None
+        else:
+            secondary = str(secondary).strip().lower()
+            if secondary != "casual":
+                secondary = None
+
+        casual_markers = (
+            "bonjour",
+            "bonsoir",
+            "salut",
+            "merci",
+            "ok",
+            "d'accord",
+        )
+        account_markers = (
+            "solde",
+            "compte",
+            "impay",
+            "dette",
+        )
+        payment_markers = (
+            "echeancier",
+            "échéancier",
+            "plan de paiement",
+            "mensual",
+            "paiement",
+        )
+
+        if primary != "tool":
+            tool_name = None
+            secondary = None
+        else:
+            if tool_name is None:
+                if any(m in t for m in payment_markers):
+                    tool_name = "mock_payment_plan"
+                elif any(m in t for m in account_markers):
+                    tool_name = "mock_account_lookup"
+                else:
+                    tool_name = "mock_account_lookup"
+
+            if any(m in t for m in casual_markers):
+                secondary = "casual"
+
+        return {
+            "primary": primary,
+            "tool_name": tool_name,
+            "secondary": secondary,
+        }
+    except Exception:
+        return default
 
 
 def _agent_node(state: AgentState) -> AgentState:
@@ -324,48 +428,12 @@ def _agent_node(state: AgentState) -> AgentState:
     """
 
     transcript = (state.get("transcript") or "").strip()
-    rag_context = (state.get("rag_context") or "").strip()
     tool_results = state.get("tool_results") or []
     agent_iterations = int(state.get("agent_iterations") or 0) + 1
     tool_call_count = int(state.get("tool_call_count") or 0)
 
-    fast = _fast_route(transcript, tool_results)
-
-    if fast == "respond":
-        return {
-            "agent_iterations": agent_iterations,
-            "tool_calls": [],
-            "response_text": "",
-        }
-
-    if fast == "account":
-        return {
-            "agent_iterations": agent_iterations,
-            "tool_calls": [
-                {"name": "mock_account_lookup", "args": {"query": transcript}}
-            ],
-            "response_text": "",
-        }
-
-    if fast == "payment":
-        import re
-
-        nums = re.findall(r"\d+", transcript)
-        n = int(nums[0]) if nums else 3
-        return {
-            "agent_iterations": agent_iterations,
-            "tool_calls": [
-                {"name": "mock_payment_plan", "args": {"requested_installments": n}}
-            ],
-            "response_text": "",
-        }
-
-    if fast == "rag":
-        return {
-            "agent_iterations": agent_iterations,
-            "tool_calls": [],
-            "response_text": "",
-        }
+    intent = _classify_intent(transcript, tool_results)
+    primary = intent.get("primary")
 
     # Hard safety rails (graph-level): never loop tools.
     # - If a tool already ran once, force respond.
@@ -377,93 +445,44 @@ def _agent_node(state: AgentState) -> AgentState:
             "response_text": "",
         }
 
-    # Construct the structured system prompt
-    system_prompt = """
-    CRITICAL:
-- Output MUST be ONLY valid JSON
-- Do NOT add any text before or after
-- Do NOT write "respond:" or anything else
-You are a banking intent router. Output ONLY a single-line JSON object (must start with '{' and end with '}').
-
-HIGHEST PRIORITY RULE:
-- If the user message is a greeting or small talk (e.g., bonjour, salut, hello, merci, ok, au revoir), ALWAYS choose respond.
-- For greetings/small talk: NEVER choose tool, NEVER choose rag.
-
-Choose ONLY ONE action:
-- respond: greetings / small talk / general explanation not needing personal account data.
-- tool: ONLY for personal/account data.
-    Trigger tool if the question is about THE USER'S account using possessives (mon/ma/mes) or mentions account data like: solde, compte, paiements, transaction(s), relevé.
-- rag: ONLY for banking concepts/definitions/general knowledge answered from documents.
-
-Tool constraints:
-- NEVER call multiple tools.
-- If unsure: {"action":"respond"}
-
-Output format (single line):
-- respond: {"action":"respond"}
-- rag: {"action":"rag"}
-- tool: {"action":"tool","tool_name":"mock_account_lookup","arguments":{"query":"<transcript>"}}
-    or {"action":"tool","tool_name":"mock_payment_plan","arguments":{"requested_installments":3}}
-
-Extra examples:
-User: Quel est mon solde ? -> {"action":"tool","tool_name":"mock_account_lookup","arguments":{"query":"<transcript>"}}
-    """
-
-    # Build tool results section for the prompt
-    if tool_results:
-        tool_results_lines = []
-        for result in tool_results:
-            tool_name = result.get("tool", "unknown")
-            status = "✓ success" if result.get("ok") else "✗ failed"
-            tool_results_lines.append(f"Tool: {tool_name} | Status: {status}")
-            # Add key parts of result
-            for key, value in result.items():
-                if key not in ("tool", "ok"):
-                    tool_results_lines.append(f"  {key}: {value}")
-        tool_results_text = "\n".join(tool_results_lines)
-    else:
-        tool_results_text = "[No tool results yet]"
-
-    user_prompt = (
-        f"User question:\n{transcript}\n\n"
-        f"Banking documents (RAG context):\n{rag_context if rag_context else '[No relevant documents found]'}\n\n"
-        f"Previous tool executions:\n{tool_results_text}\n\n"
-    )
-
-    user_prompt += "Output JSON response:"
-
-    # Call LLM statelessly (no ConversationSession, no extra system prompt).
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    llm_output = (call_llm_raw(messages, num_predict=32, temperature=0.0) or "").strip()
-    print(f"[AGENT RAW OUTPUT] {llm_output!r}")
-
-    # Parse JSON output strictly
-    parsed = _parse_agent_json_output(llm_output)
-
-    action = parsed.get("action")
-    if action == "tool":
-        # Tool execution requested
-        return {
-            "agent_iterations": agent_iterations,
-            "tool_calls": [
-                {
-                    "name": parsed["tool_name"],
-                    "args": parsed.get("arguments", {}),
-                }
-            ],
-            "response_text": "",
-        }
-    else:  # action == "respond" or action == "rag"
-        # IMPORTANT: LangGraph must NOT generate a final natural-language response.
-        # main.py will generate the final response in a streaming fashion.
+    if primary == "casual":
         return {
             "agent_iterations": agent_iterations,
             "tool_calls": [],
             "response_text": "",
         }
+
+    if primary == "tool":
+        return {
+            "agent_iterations": agent_iterations,
+            "tool_calls": [
+                {
+                    "name": intent.get("tool_name"),
+                    "args": {"query": transcript},
+                }
+            ],
+            "response_text": "",
+        }
+
+    if primary == "rag":
+        return {
+            "agent_iterations": agent_iterations,
+            "tool_calls": [],
+            "response_text": "",
+        }
+
+    if primary == "general":
+        return {
+            "agent_iterations": agent_iterations,
+            "tool_calls": [],
+            "response_text": "",
+        }
+
+    return {
+        "agent_iterations": agent_iterations,
+        "tool_calls": [],
+        "response_text": "",
+    }
 
 
 def _mock_account_lookup(args: Dict) -> Dict:
@@ -662,9 +681,12 @@ seed_chroma()
 
 
 def run_voice_agent_turn(transcript: str) -> AgentState:
+    intent = _classify_intent(transcript, [])
+    route = intent["primary"]
+
     initial_state: AgentState = {
         "transcript": transcript,
-        "route": _fast_route(transcript, []),
+        "route": route,
         "rag_context": "",
         "tool_calls": [],
         "tool_results": [],
@@ -676,12 +698,23 @@ def run_voice_agent_turn(transcript: str) -> AgentState:
 
 
 def run_voice_agent_prepare(transcript: str) -> dict:
-    state = run_voice_agent_turn(transcript)
+    intent = _classify_intent(transcript, [])
+    initial_state: AgentState = {
+        "transcript": transcript,
+        "route": intent["primary"],
+        "rag_context": "",
+        "tool_calls": [],
+        "tool_results": [],
+        "response_text": "",
+        "agent_iterations": 0,
+        "tool_call_count": 0,
+    }
+    result = _app.invoke(initial_state, config={"recursion_limit": 10})
     return {
-        "transcript": state.get("transcript", ""),
-        "rag_context": state.get("rag_context", ""),
-        "tool_results": state.get("tool_results", []),
-        "route": state.get("route"),
+        "transcript": result.get("transcript", ""),
+        "rag_context": result.get("rag_context", ""),
+        "tool_results": result.get("tool_results", []),
+        "route": intent["primary"],
     }
 
 

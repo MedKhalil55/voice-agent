@@ -306,61 +306,46 @@ class VoiceAgent:
                 f"[RAG DEBUG] rag_context: {repr(state.get('rag_context', '')[:300])}"
             )
 
+            route = state.get("route", "general")
             rag = (state.get("rag_context") or "").strip()
             tool_res = state.get("tool_results") or []
-            route = state.get("route")
 
-            is_casual = (route == "respond") and not tool_res
-
-            if is_casual:
-                rag = ""  # prevent RAG pollution for casual messages
+            if route == "casual":
                 system_msg = (
-    "Tu es un assistant bancaire humain et chaleureux.\n\n"
-    "RÈGLES:\n"
-    "- Si le client dit bonjour → réponds bonjour naturellement\n"
-    "- Si le client dit merci → réponds avec plaisir\n"
-    "- Ne JAMAIS dire 'Je n'ai pas cette information' pour du small talk\n"
-    "- Réponds comme un humain, pas comme un robot\n"
-    "- 1 phrase courte\n\n"
-    "Exemples:\n"
-    "Client: Bonjour\n"
-    "Assistant: Bonjour ! Comment puis-je vous aider aujourd'hui ?\n\n"
-    "Client: Merci\n"
-    "Assistant: Avec plaisir !"
-)
-                user_msg = f"Client: {state['transcript']}\nAssistant:"
+                    "Tu es un assistant bancaire chaleureux et humain. "
+                    "Réponds naturellement et brièvement aux salutations et small talk. "
+                    "1 phrase courte maximum. Sois amical et professionnel."
+                )
+                user_msg = state["transcript"]
 
             elif tool_res:
                 system_msg = (
-                    "Tu es un assistant bancaire.\n"
-                    "Ta mission: transformer les données JSON en réponse naturelle.\n\n"
-                    "RÈGLES:\n"
-                    "- Ne JAMAIS afficher du JSON\n"
-                    "- Ne JAMAIS afficher de structure technique\n"
-                    "- Répondre comme un humain\n"
-                    "- 1 à 2 phrases maximum\n"
-                    "- Être clair et professionnel\n\n"
-                    "EXEMPLE:\n"
-                    "input: {'outstanding_amount': 2450.0}\n"
-                    "output: Votre montant dû est de 2450 dinars."
+                    "Tu es un assistant bancaire professionnel. "
+                    "Transforme ces données en réponse naturelle et claire, 1 à 2 phrases. "
+                    "Ne montre jamais de JSON ou de structure technique. "
+                    "Sois chaleureux et précis."
                 )
+                user_msg = f"Question: {state['transcript']}\nDonnées: {tool_res}\nRéponse naturelle:"
 
-                user_msg = (
-                    f"Question client: {state['transcript']}\n\n"
-                    f"Données outil:\n{tool_res}\n\n"
-                    "Réponse naturelle:"
+            elif route == "rag" and rag:
+                system_msg = (
+                    "Tu es un assistant bancaire expert. "
+                    "Réponds à la question en utilisant UNIQUEMENT le contexte fourni. "
+                    "Si la réponse n'est pas dans le contexte, dis 'Je n'ai pas cette information dans ma documentation'. "
+                    "Réponse claire et concise en 1 à 2 phrases."
                 )
+                user_msg = f"Question: {state['transcript']}\nContexte documentaire: {rag[:600]}\nRéponse:"
 
             else:
+                # General banking question — LLM answers from its own knowledge
                 system_msg = (
-                    "Tu es un assistant bancaire strict.\n"
-                    "Tu dois répondre UNIQUEMENT avec le CONTEXTE fourni.\n\n"
-                    "RÈGLES:\n"
-                    "- Si la réponse n'est pas dans le contexte → dis 'Je n'ai pas cette information'\n"
-                    "- Ne jamais inventer\n"
-                    "- Réponse courte (1-2 phrases)"
+                    "Tu es un assistant bancaire expert francophone. "
+                    "Tu peux répondre aux questions générales sur la banque, la finance, les produits bancaires, "
+                    "les réglementations, les conseils financiers, etc. "
+                    "Réponds de façon claire, professionnelle et humaine. 2 à 3 phrases maximum. "
+                    "Ne dis JAMAIS 'Je n'ai pas cette information' pour une question générale à laquelle tu connais la réponse."
                 )
-                user_msg = f"{state['transcript']} CONTEXTE: {rag[:500]}"
+                user_msg = state["transcript"]
 
             self._stt.pause()
             try:
