@@ -535,7 +535,7 @@ def _stream_ollama_tokens(messages_raw: list[dict]):
             options[key] = val
 
     # num_predict: low cap reduces rambling and improves TTS latency.
-    options.setdefault("num_predict", 256)
+    options.setdefault("num_predict", 80)
     # temperature: low randomness for stable/professional voice responses.
     options.setdefault("temperature", 0.2)
     # top_p/top_k: keep decoding focused and coherent.

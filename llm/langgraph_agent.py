@@ -136,11 +136,9 @@ def _retrieve_node(state: AgentState) -> AgentState:
     if not transcript:
         return {"rag_context": ""}
 
-    # Reuse precomputed route when present to avoid a second LLM classification.
     route = state.get("route")
     if route is None:
-        intent = _classify_intent(transcript, [])
-        route = intent["primary"]
+        route = "general"
 
     # Optimization: avoid RAG latency unless we explicitly need RAG.
     if route not in ("rag",):
@@ -150,7 +148,7 @@ def _retrieve_node(state: AgentState) -> AgentState:
         collection = _get_chroma_collection()
         result = collection.query(
             query_texts=[transcript],
-            n_results=8,
+            n_results=3,
             include=["documents", "distances"],
         )
         docs = (result.get("documents") or [[]])[0]
@@ -178,8 +176,14 @@ def _retrieve_node(state: AgentState) -> AgentState:
             score = (-distance) + (0.15 * lexical_hits)
             scored_docs.append((score, doc))
 
+        scored_docs = [
+            (s, d)
+            for s, d in scored_docs
+            if s > -0.25  # stricter threshold
+        ]
+
         scored_docs.sort(key=lambda item: item[0], reverse=True)
-        top_docs = [doc for _, doc in scored_docs[:3]]
+        top_docs = [doc for _, doc in scored_docs[:2]]
         rag_context = "\n".join(top_docs)
     except Exception:
         rag_context = ""
@@ -287,21 +291,81 @@ def _classify_intent(transcript: str, tool_results: list) -> dict:
     t = " ".join((transcript or "").lower().split())
     t = re.sub(r"[\s\.,;:!?…]+$", "", t)
 
-    casual_only = (
+    # Extended keyword fast-path (no LLM call needed for obvious cases)
+    CASUAL_EXACT = {
         "bonjour",
         "bonsoir",
         "salut",
         "merci",
+        "merci beaucoup",
+        "bonne journée",
+        "comment allez-vous",
+        "ça va",
+    }
+    ACK_EXACT = {
         "ok",
+        "okay",
         "d'accord",
-        "au revoir",
-    )
-    if t in casual_only:
+        "dacord",
+        "compris",
+        "entendu",
+        "très bien",
+        "parfait",
+        "je vois",
+        "oui",
+        "non",
+        "oui merci",
+        "non merci",
+    }
+
+    if t in CASUAL_EXACT:
         return {
             "primary": "casual",
             "tool_name": None,
             "secondary": None,
         }
+    if t in ACK_EXACT:
+        return {
+            "primary": "ack",
+            "tool_name": None,
+            "secondary": None,
+        }
+
+    # Account/payment keyword fast-path (avoids LLM for clear tool intents)
+    ACCOUNT_KW = (
+        "mon solde",
+        "mon compte",
+        "mes impayés",
+        "mon impayé",
+        "ma dette",
+        "mes transactions",
+        "mon relevé",
+    )
+    PAYMENT_KW = (
+        "plan de paiement",
+        "échéancier",
+        "payer en plusieurs",
+        "mensualités",
+        "échelonner",
+    )
+
+    t_full = (transcript or "").lower()
+    if any(kw in t_full for kw in ACCOUNT_KW):
+        has_greeting = any(g in t_full for g in ("bonjour", "bonsoir", "salut"))
+        return {
+            "primary": "tool",
+            "tool_name": "mock_account_lookup",
+            "secondary": "casual" if has_greeting else None,
+        }
+    if any(kw in t_full for kw in PAYMENT_KW):
+        has_greeting = any(g in t_full for g in ("bonjour", "bonsoir", "salut"))
+        return {
+            "primary": "tool",
+            "tool_name": "mock_payment_plan",
+            "secondary": "casual" if has_greeting else None,
+        }
+
+    # Only call LLM for ambiguous cases
 
     INTENT_CLASSIFIER_SYSTEM = """You are a banking intent classifier. Output ONLY one line of valid JSON, nothing else.
 
@@ -331,7 +395,7 @@ Examples:
 
     user_prompt = f"User message: {transcript}\nReturn JSON only."
 
-    raw = (
+    raw_output = (
         call_llm_raw(
             [
                 {"role": "system", "content": INTENT_CLASSIFIER_SYSTEM},
@@ -344,11 +408,11 @@ Examples:
     ).strip()
 
     try:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start < 0 or end < start:
+        match = re.search(r"\{.*?\}", raw_output, flags=re.DOTALL)
+        if not match:
             raise ValueError("No JSON object")
-        parsed = json.loads(raw[start : end + 1])
+
+        parsed = json.loads(match.group(0))
         if not isinstance(parsed, dict):
             raise ValueError("JSON is not an object")
 
@@ -358,7 +422,7 @@ Examples:
 
         tool_name = parsed.get("tool_name")
         if tool_name not in ("mock_account_lookup", "mock_payment_plan", None):
-            tool_name = None
+            raise ValueError("Invalid tool_name")
 
         secondary = parsed.get("secondary")
         if secondary is None:
@@ -411,6 +475,7 @@ Examples:
             "secondary": secondary,
         }
     except Exception:
+        print("Intent parse error:", raw_output)
         return default
 
 
@@ -428,12 +493,12 @@ def _agent_node(state: AgentState) -> AgentState:
     """
 
     transcript = (state.get("transcript") or "").strip()
-    tool_results = state.get("tool_results") or []
+    route = state.get("route")
+    if route is None:
+        route = "general"
+
     agent_iterations = int(state.get("agent_iterations") or 0) + 1
     tool_call_count = int(state.get("tool_call_count") or 0)
-
-    intent = _classify_intent(transcript, tool_results)
-    primary = intent.get("primary")
 
     # Hard safety rails (graph-level): never loop tools.
     # - If a tool already ran once, force respond.
@@ -445,33 +510,40 @@ def _agent_node(state: AgentState) -> AgentState:
             "response_text": "",
         }
 
-    if primary == "casual":
+    if route == "casual":
         return {
             "agent_iterations": agent_iterations,
             "tool_calls": [],
             "response_text": "",
         }
 
-    if primary == "tool":
+    if route == "tool":
+        t = " ".join(transcript.lower().split())
+        tool_name = "mock_account_lookup"
+        if any(
+            s in t for s in ("mensualité", "échéancier", "plan de paiement", "paiement")
+        ):
+            tool_name = "mock_payment_plan"
+
         return {
             "agent_iterations": agent_iterations,
             "tool_calls": [
                 {
-                    "name": intent.get("tool_name"),
+                    "name": tool_name,
                     "args": {"query": transcript},
                 }
             ],
             "response_text": "",
         }
 
-    if primary == "rag":
+    if route == "rag":
         return {
             "agent_iterations": agent_iterations,
             "tool_calls": [],
             "response_text": "",
         }
 
-    if primary == "general":
+    if route == "general":
         return {
             "agent_iterations": agent_iterations,
             "tool_calls": [],
@@ -681,12 +753,9 @@ seed_chroma()
 
 
 def run_voice_agent_turn(transcript: str) -> AgentState:
-    intent = _classify_intent(transcript, [])
-    route = intent["primary"]
-
     initial_state: AgentState = {
         "transcript": transcript,
-        "route": route,
+        "route": "general",
         "rag_context": "",
         "tool_calls": [],
         "tool_results": [],
@@ -698,6 +767,7 @@ def run_voice_agent_turn(transcript: str) -> AgentState:
 
 
 def run_voice_agent_prepare(transcript: str) -> dict:
+    # CRITICAL: intent must be computed once to avoid latency explosion
     intent = _classify_intent(transcript, [])
     initial_state: AgentState = {
         "transcript": transcript,
@@ -726,3 +796,11 @@ if __name__ == "__main__":
     print("tool_calls:    ", result["tool_calls"])
     print("tool_results:  ", result["tool_results"])
     print("response_text: ", result["response_text"])
+
+    graph = build_voice_agent_graph()
+    try:
+        graph.get_graph().draw_png("graph.png")
+    except ImportError:
+        png_bytes = graph.get_graph().draw_mermaid_png()
+        with open("graph.png", "wb") as file:
+            file.write(png_bytes)

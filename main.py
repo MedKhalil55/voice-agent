@@ -309,43 +309,120 @@ class VoiceAgent:
             route = state.get("route", "general")
             rag = (state.get("rag_context") or "").strip()
             tool_res = state.get("tool_results") or []
+            secondary = state.get("secondary")
+            transcript_norm = " ".join(state["transcript"].lower().split()).rstrip(
+                ".!?"
+            )
 
-            if route == "casual":
+            # Detect ASR correction pattern: "je suis désolé, j'ai dit X" -> extract X as real question
+            import re as _re
+
+            correction_match = _re.search(
+                r"(?:je suis désolé[,.]?\s*)?j['\s]ai dit\s+(.+)",
+                state["transcript"].lower(),
+            )
+            if correction_match:
+                corrected = correction_match.group(1).strip()
+                # Re-route as a general banking question with the corrected term
+                route = "general"
+                user_msg_override = corrected
+            else:
+                user_msg_override = None
+
+            if route == "ack":
+                self.speak("Très bien, je reste à votre disposition.")
+                return
+
+            ACK_TOKENS = {
+                "ok",
+                "okay",
+                "d'accord",
+                "dacord",
+                "je vois",
+                "compris",
+                "entendu",
+                "très bien",
+                "parfait",
+            }
+
+            if route == "ack" or transcript_norm in ACK_TOKENS:
                 system_msg = (
-                    "Tu es un assistant bancaire chaleureux et humain. "
-                    "Réponds naturellement et brièvement aux salutations et small talk. "
-                    "1 phrase courte maximum. Sois amical et professionnel."
+                    "Parle comme un conseiller bancaire humain au téléphone. "
+                    "Utilise un ton naturel, simple, et direct. "
+                    "Évite les définitions académiques."
                 )
                 user_msg = state["transcript"]
+                if user_msg_override is not None:
+                    user_msg = user_msg_override
+
+            elif route == "casual":
+                system_msg = (
+                    "Parle comme un conseiller bancaire humain au téléphone. "
+                    "Utilise un ton naturel, simple, et direct. "
+                    "Évite les définitions académiques."
+                )
+                user_msg = state["transcript"]
+                if user_msg_override is not None:
+                    user_msg = user_msg_override
 
             elif tool_res:
+                if not any(r.get("ok") for r in tool_res):
+                    # All tools failed
+                    for sentence in stream_raw_sentences(
+                        "erreur outil",
+                        system_content="Dis: 'Je n arrive pas à récupérer vos données pour le moment.'",
+                    ):
+                        self.speak(sentence)
+                    return
+                greeting = "Bien sûr ! " if secondary == "casual" else ""
                 system_msg = (
-                    "Tu es un assistant bancaire professionnel. "
-                    "Transforme ces données en réponse naturelle et claire, 1 à 2 phrases. "
-                    "Ne montre jamais de JSON ou de structure technique. "
-                    "Sois chaleureux et précis."
+                    "Parle comme un conseiller bancaire humain au téléphone. "
+                    "Utilise un ton naturel, simple, et direct. "
+                    "Évite les définitions académiques."
                 )
-                user_msg = f"Question: {state['transcript']}\nDonnées: {tool_res}\nRéponse naturelle:"
+                user_msg = (
+                    f"{'Commence par: ' + greeting if greeting else ''}"
+                    f"Question: {state['transcript']}\n"
+                    f"Données: {tool_res}\n"
+                    f"Réponse naturelle:"
+                )
+                if user_msg_override is not None:
+                    user_msg = user_msg_override
 
-            elif route == "rag" and rag:
-                system_msg = (
-                    "Tu es un assistant bancaire expert. "
-                    "Réponds à la question en utilisant UNIQUEMENT le contexte fourni. "
-                    "Si la réponse n'est pas dans le contexte, dis 'Je n'ai pas cette information dans ma documentation'. "
-                    "Réponse claire et concise en 1 à 2 phrases."
-                )
-                user_msg = f"Question: {state['transcript']}\nContexte documentaire: {rag[:600]}\nRéponse:"
+            elif route == "rag":
+                if rag:
+                    system_msg = (
+                        "Parle comme un conseiller bancaire humain au téléphone. "
+                        "Utilise un ton naturel, simple, et direct. "
+                        "Évite les définitions académiques."
+                    )
+                    user_msg = (
+                        f"Question: {state['transcript']}\n"
+                        f"Contexte (utilise-le SEULEMENT s'il est directement lié à la question): {rag[:200]}\n"
+                        f"Réponse:"
+                    )
+                    if user_msg_override is not None:
+                        user_msg = user_msg_override
+                else:
+                    system_msg = (
+                        "Parle comme un conseiller bancaire humain au téléphone. "
+                        "Utilise un ton naturel, simple, et direct. "
+                        "Évite les définitions académiques."
+                    )
+                    user_msg = state["transcript"]
+                    if user_msg_override is not None:
+                        user_msg = user_msg_override
 
             else:
-                # General banking question — LLM answers from its own knowledge
+                # general
                 system_msg = (
-                    "Tu es un assistant bancaire expert francophone. "
-                    "Tu peux répondre aux questions générales sur la banque, la finance, les produits bancaires, "
-                    "les réglementations, les conseils financiers, etc. "
-                    "Réponds de façon claire, professionnelle et humaine. 2 à 3 phrases maximum. "
-                    "Ne dis JAMAIS 'Je n'ai pas cette information' pour une question générale à laquelle tu connais la réponse."
+                    "Parle comme un conseiller bancaire humain au téléphone. "
+                    "Utilise un ton naturel, simple, et direct. "
+                    "Évite les définitions académiques."
                 )
                 user_msg = state["transcript"]
+                if user_msg_override is not None:
+                    user_msg = user_msg_override
 
             self._stt.pause()
             try:
