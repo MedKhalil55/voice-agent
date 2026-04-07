@@ -424,6 +424,14 @@ class VoiceAgent:
                 if user_msg_override is not None:
                     user_msg = user_msg_override
 
+            # Universal language lock: avoid multilingual drift in long generations.
+            system_msg += (
+                " Réponds exclusivement en français. "
+                "N'utilise jamais l'espagnol, le portugais, ni l'anglais. "
+                "Si un montant est mentionné, garde la devise telle qu'elle est fournie dans les données. "
+                "Si aucune devise n'est fournie, n'en invente pas."
+            )
+
             self._stt.pause()
             try:
                 for sentence in stream_raw_sentences(
