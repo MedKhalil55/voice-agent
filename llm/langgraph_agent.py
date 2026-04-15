@@ -260,11 +260,23 @@ def chunk_legal_pdf(text: str) -> list[dict]:
     return chunks
 
 
-def _hybrid_score(query: str, docs: list[str], distances: list[float]) -> list[str]:
+def _hybrid_score(
+    query: str,
+    docs: list[str],
+    distances: list[float],
+    metadatas: list[dict] | None = None,
+) -> list[str]:
     """Rank docs with a cosine/BM25 hybrid score and return top filtered docs."""
 
     if not docs:
         return []
+
+    # Hard cap: drop any doc with cosine distance above 0.28
+    pairs = [(d, dist) for d, dist in zip(docs, distances) if float(dist) < 0.25]
+    if not pairs:
+        return []
+    docs, distances = zip(*pairs)
+    docs, distances = list(docs), list(distances)
 
     from rank_bm25 import BM25Okapi
 
@@ -286,13 +298,31 @@ def _hybrid_score(query: str, docs: list[str], distances: list[float]) -> list[s
 
         bm25_raw = float(bm25_scores[i]) if i < len(bm25_scores) else 0.0
         bm25_norm = (bm25_raw / max_bm25) if max_bm25 > 0.0 else 0.0
+        if cosine_component < 0.70:
+            bm25_norm *= 0.3
 
-        hybrid = (0.6 * cosine_component) + (0.4 * bm25_norm)
+        hybrid = (0.75 * cosine_component) + (0.25 * bm25_norm)
         scored.append((hybrid, doc))
 
     scored.sort(key=lambda item: item[0], reverse=True)
 
-    filtered = [doc for score, doc in scored if score > 0.4][:2]
+    # Deduplicate by article number: keep only the highest-scoring chunk per article
+    if metadatas:
+        seen_articles: set[str] = set()
+        deduped: list[tuple[float, str]] = []
+        for (score, doc), meta in zip(
+            scored,
+            [metadatas[docs.index(d)] for _, d in scored]
+            if metadatas
+            else [{}] * len(scored),
+        ):
+            article_id = (meta or {}).get("article", "unknown")
+            if article_id not in seen_articles:
+                seen_articles.add(article_id)
+                deduped.append((score, doc))
+        scored = deduped
+
+    filtered = [doc for score, doc in scored if score > 0.50][:2]
     if filtered:
         return filtered
 
@@ -318,12 +348,13 @@ def _retrieve_node(state: AgentState) -> AgentState:
 
         result = collection.query(
             query_embeddings=[query_vec],
-            n_results=6,
-            include=["documents", "distances"],
+            n_results=10,
+            include=["documents", "distances", "metadatas"],
         )
         docs = (result.get("documents") or [[]])[0]
         distances = (result.get("distances") or [[]])[0]
-        top_docs = _hybrid_score(transcript, docs, distances)
+        metadatas = (result.get("metadatas") or [[]])[0]
+        top_docs = _hybrid_score(transcript, docs, distances, metadatas=metadatas)
         rag_context = "\n\n".join(top_docs).strip()
         if len(rag_context) > 800:
             rag_context = rag_context[:800].rstrip()
