@@ -261,6 +261,8 @@ class VoiceAgent:
             return
 
         normalized = " ".join(cleaned.lower().split())
+        if len(normalized) < 3 or all(c in ".,!?…- " for c in normalized):
+            return
         if not normalized:
             return
 
@@ -391,23 +393,21 @@ class VoiceAgent:
 
             elif route == "rag":
                 if rag:
-                    system_msg = (
-                        "Parle comme un conseiller bancaire humain au téléphone. "
-                        "Utilise un ton naturel, simple, et direct. "
-                        "Évite les définitions académiques."
-                    )
+                    system_msg = "Tu es un conseiller bancaire tunisien qui parle à un client au téléphone. En utilisant le contexte juridique fourni, explique la réponse en langage simple et naturel comme tu parlerais à quelqu'un qui ne connaît pas le droit. Cite l'article uniquement si c'est utile pour rassurer le client. Maximum 2 phrases courtes. Ne lis pas le texte juridique mot pour mot."
                     user_msg = (
-                        f"Question: {state['transcript']}\n"
-                        f"Contexte (utilise-le SEULEMENT s'il est directement lié à la question): {rag[:200]}\n"
-                        f"Réponse:"
+                        f"Contexte juridique (utilise-le obligatoirement): {rag[:500]}\n\n"
+                        f"Question du client: {state['transcript']}\n"
+                        f"Réponse courte:"
                     )
                     if user_msg_override is not None:
                         user_msg = user_msg_override
                 else:
                     system_msg = (
-                        "Parle comme un conseiller bancaire humain au téléphone. "
-                        "Utilise un ton naturel, simple, et direct. "
-                        "Évite les définitions académiques."
+                        "Tu es un conseiller bancaire tunisien. "
+                        "Parle comme un humain au téléphone. "
+                        "Réponds avec ta connaissance générale bancaire, de façon claire et simple. "
+                        "1 à 2 phrases maximum. "
+                        "Ne dis jamais 'je n’ai pas cette information'."
                     )
                     user_msg = state["transcript"]
                     if user_msg_override is not None:
@@ -429,7 +429,9 @@ class VoiceAgent:
                 " Réponds exclusivement en français. "
                 "N'utilise jamais l'espagnol, le portugais, ni l'anglais. "
                 "Si un montant est mentionné, garde la devise telle qu'elle est fournie dans les données. "
-                "Si aucune devise n'est fournie, n'en invente pas."
+                "Si aucune devise n'est fournie, n'en invente pas. "
+                "Les montants sont en dinars tunisiens (DT), pas en euros. "
+                "Ne dis jamais 'euros', dis toujours 'dinars' ou 'DT'."
             )
 
             self._stt.pause()

@@ -9,6 +9,7 @@ retrieve -> agent -> conditional
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from importlib import import_module
 from typing import Dict, List, TypedDict
@@ -32,47 +33,92 @@ class AgentState(TypedDict):
     tool_call_count: int
 
 
+_CHROMA_COLLECTION = None
+_CHROMA_CLIENT = None
+_CHROMA_EMBEDDING_FN = None
+
+
+class _OllamaEmbeddingFn:
+    """Custom Ollama embedding function compatible with ChromaDB query interface."""
+
+    def __init__(self, base_url: str, model_name: str) -> None:
+        self._url = f"{base_url.rstrip('/')}/api/embeddings"
+        self._model = model_name
+
+    def name(self) -> str:
+        return f"ollama-{self._model}"
+
+    def _embed_one(self, text: str) -> list[float]:
+        import requests
+
+        resp = requests.post(
+            self._url,
+            json={"model": self._model, "prompt": text},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        vec = resp.json().get("embedding", [])
+        if not vec or not isinstance(vec, list):
+            raise ValueError(f"Empty or invalid embedding from model={self._model!r}")
+        # Ensure every element is a plain float
+        return [float(v) for v in vec]
+
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed_one(t) for t in texts]
+
+    def __call__(self, input: list[str]) -> list[list[float]]:  # noqa: A002
+        return self._embed(input)
+
+    def embed_query(self, input: str | list[str] = None, **kwargs) -> list[float]:  # noqa: A002
+        # ChromaDB may call this as embed_query(input=text) or embed_query(text)
+        if input is None:
+            input = kwargs.get("input", "")
+        if isinstance(input, list):
+            return self._embed_one(input[0])
+        return self._embed_one(input)
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._embed(texts)
+
+
 def _get_chroma_collection():
-    """Get or create the default Chroma collection used for retrieval."""
+    global _CHROMA_COLLECTION, _CHROMA_CLIENT, _CHROMA_EMBEDDING_FN
+    if _CHROMA_COLLECTION is not None:
+        return _CHROMA_COLLECTION
 
     chromadb = import_module("chromadb")
-    embedding_functions = import_module("chromadb.utils.embedding_functions")
 
     chroma_path = os.environ.get("VOICE_AGENT_CHROMA_PATH", "artifacts/chroma")
     collection_name = os.environ.get(
-        "VOICE_AGENT_CHROMA_COLLECTION", "voice_agent_docs_mxbai"
+        "VOICE_AGENT_CHROMA_COLLECTION", "voice_agent_docs_nomic"
     )
     ollama_base_url = os.environ.get(
         "VOICE_AGENT_OLLAMA_BASE_URL", "http://localhost:11434"
     )
     embedding_model = os.environ.get(
-        "VOICE_AGENT_EMBED_MODEL", "mxbai-embed-large:latest"
+        "VOICE_AGENT_EMBED_MODEL", "nomic-embed-text:latest"
     )
 
-    embedding_fn = embedding_functions.OllamaEmbeddingFunction(
-        url=f"{ollama_base_url.rstrip('/')}/api/embeddings",
-        model_name=embedding_model,
+    if _CHROMA_EMBEDDING_FN is None:
+        _CHROMA_EMBEDDING_FN = _OllamaEmbeddingFn(
+            base_url=ollama_base_url,
+            model_name=embedding_model,
+        )
+
+    if _CHROMA_CLIENT is None:
+        _CHROMA_CLIENT = chromadb.PersistentClient(path=chroma_path)
+
+    # get_or_create_collection is atomic and works with newer ChromaDB
+    _CHROMA_COLLECTION = _CHROMA_CLIENT.get_or_create_collection(
+        name=collection_name,
+        embedding_function=_CHROMA_EMBEDDING_FN,
+        metadata={"hnsw:space": "cosine"},
     )
 
-    client = chromadb.PersistentClient(path=chroma_path)
-
-    def _open_or_create(name: str):
-        try:
-            return client.get_collection(name=name, embedding_function=embedding_fn)
-        except Exception:
-            return client.create_collection(
-                name=name,
-                embedding_function=embedding_fn,
-                metadata={"hnsw:space": "cosine"},
-            )
-
-    try:
-        return _open_or_create(collection_name)
-    except Exception:
-        # If a collection already exists with a different embedding function,
-        # switch to a dedicated mxbai collection name.
-        fallback_name = f"{collection_name}_mxbai"
-        return _open_or_create(fallback_name)
+    print(
+        f"[CHROMA] Collection '{collection_name}' loaded, count={_CHROMA_COLLECTION.count()}"
+    )
+    return _CHROMA_COLLECTION
 
 
 def _extract_pdf_text(pdf_path: Path) -> str:
@@ -101,93 +147,194 @@ def _extract_pdf_text(pdf_path: Path) -> str:
     return "\n\n".join(pages)
 
 
-def _chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
-    """Split text into overlapping character chunks."""
+def _split_long_article(text, article_num):
+    """Split a long legal article into overlapping subchunks."""
 
     source = " ".join((text or "").split())
     if not source:
         return []
 
-    size = max(int(chunk_size), 200)
-    overlap = max(0, min(int(chunk_overlap), size - 1))
-    step = max(1, size - overlap)
+    max_size = 500
+    overlap = 80
+    words = source.split(" ")
 
-    chunks: List[str] = []
-    start = 0
-    while start < len(source):
-        end = min(start + size, len(source))
-        chunk = source[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if end >= len(source):
+    chunks: list[dict] = []
+    start_word = 0
+    total_words = len(words)
+
+    while start_word < total_words:
+        end_word = start_word
+        char_count = 0
+
+        # Grow a chunk one whole word at a time, keeping size near max_size.
+        while end_word < total_words:
+            word_len = len(words[end_word])
+            add_len = word_len if char_count == 0 else word_len + 1
+
+            if end_word > start_word and char_count + add_len > max_size:
+                break
+
+            # Always include at least one word, even if that single word exceeds max_size.
+            char_count += add_len
+            end_word += 1
+
+            if char_count > max_size:
+                break
+
+        if end_word <= start_word:
+            end_word = start_word + 1
+
+        chunk_text = " ".join(words[start_word:end_word]).strip()
+        if chunk_text:
+            chunks.append(
+                {
+                    "text": chunk_text,
+                    "article": article_num,
+                    "type": "article",
+                }
+            )
+
+        if end_word >= total_words:
             break
-        start += step
+
+        overlap_chars = 0
+        next_start = end_word
+
+        # Step backward from chunk end until overlap budget is met.
+        while next_start > start_word:
+            previous_word_len = len(words[next_start - 1])
+            add_len = previous_word_len if overlap_chars == 0 else previous_word_len + 1
+            overlap_chars += add_len
+            next_start -= 1
+            if overlap_chars >= overlap:
+                break
+
+        if next_start <= start_word:
+            next_start = start_word + 1
+
+        start_word = next_start
+
     return chunks
 
 
+def chunk_legal_pdf(text: str) -> list[dict]:
+    """Chunk legal PDFs by article, preserving article semantics."""
+
+    source = " ".join((text or "").split())
+    if not source:
+        return []
+
+    pattern = re.compile(r"(Art(?:icle)?\.?\s*\d+\s*[-–])", flags=re.IGNORECASE)
+    parts = pattern.split(source)
+
+    chunks: list[dict] = []
+
+    # No article markers found: keep one fallback chunk.
+    if len(parts) < 3:
+        if len(source) > 800:
+            return _split_long_article(source, "unknown")
+        return [{"text": source, "article": "unknown", "type": "article"}]
+
+    # parts format: [prefix, marker1, body1, marker2, body2, ...]
+    for i in range(1, len(parts), 2):
+        marker = (parts[i] or "").strip()
+        body = (parts[i + 1] if i + 1 < len(parts) else "").strip()
+        article_text = f"{marker} {body}".strip()
+        if not article_text:
+            continue
+
+        num_match = re.search(r"\d+", marker)
+        article_num = num_match.group(0) if num_match else "unknown"
+
+        if len(article_text) > 800:
+            chunks.extend(_split_long_article(article_text, article_num))
+        else:
+            chunks.append(
+                {
+                    "text": article_text,
+                    "article": article_num,
+                    "type": "article",
+                }
+            )
+
+    return chunks
+
+
+def _hybrid_score(query: str, docs: list[str], distances: list[float]) -> list[str]:
+    """Rank docs with a cosine/BM25 hybrid score and return top filtered docs."""
+
+    if not docs:
+        return []
+
+    from rank_bm25 import BM25Okapi
+
+    query_tokens = (query or "").lower().split()
+    tokenized_docs = [(doc or "").lower().split() for doc in docs]
+
+    if any(tokenized_docs):
+        bm25 = BM25Okapi(tokenized_docs)
+        bm25_scores = bm25.get_scores(query_tokens)
+    else:
+        bm25_scores = [0.0] * len(docs)
+
+    max_bm25 = max(float(score) for score in bm25_scores) if len(bm25_scores) else 0.0
+
+    scored: list[tuple[float, str]] = []
+    for i, doc in enumerate(docs):
+        distance = float(distances[i]) if i < len(distances) else 1.0
+        cosine_component = 1.0 - distance
+
+        bm25_raw = float(bm25_scores[i]) if i < len(bm25_scores) else 0.0
+        bm25_norm = (bm25_raw / max_bm25) if max_bm25 > 0.0 else 0.0
+
+        hybrid = (0.6 * cosine_component) + (0.4 * bm25_norm)
+        scored.append((hybrid, doc))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    filtered = [doc for score, doc in scored if score > 0.4][:2]
+    if filtered:
+        return filtered
+
+    return [scored[0][1]]
+
+
 def _retrieve_node(state: AgentState) -> AgentState:
-    """Retrieve relevant context from ChromaDB using the transcript as a query.
-
-    Always runs - provides RAG context for every query.
-    The LLM will decide how to use this context (or ignore it if not relevant).
-    """
-
     transcript = (state.get("transcript") or "").strip()
+    if state.get("route") in ("casual", "ack", "tool"):
+        return {"rag_context": ""}
     if not transcript:
         return {"rag_context": ""}
 
-    route = state.get("route")
-    if route is None:
-        route = "general"
-
-    # Optimization: avoid RAG latency unless we explicitly need RAG.
-    if route not in ("rag",):
-        return {"rag_context": ""}
+    docs = []
+    distances = []
+    top_docs = []
 
     try:
         collection = _get_chroma_collection()
+
+        # Embed la query manuellement — évite les problèmes d'interface ChromaDB
+        query_vec = _CHROMA_EMBEDDING_FN._embed_one(transcript)
+
         result = collection.query(
-            query_texts=[transcript],
-            n_results=3,
+            query_embeddings=[query_vec],
+            n_results=6,
             include=["documents", "distances"],
         )
         docs = (result.get("documents") or [[]])[0]
         distances = (result.get("distances") or [[]])[0]
+        top_docs = _hybrid_score(transcript, docs, distances)
+        rag_context = "\n\n".join(top_docs).strip()
+        if len(rag_context) > 800:
+            rag_context = rag_context[:800].rstrip()
 
-        # Rerank results by semantic similarity + lightweight lexical overlap.
-        # Pure embedding distance can sometimes miss the best chunk for
-        # product names / abbreviations.
-        query_terms = [t for t in transcript.lower().split() if len(t) >= 4]
-        query_term_set = set(query_terms)
-
-        scored_docs = []
-        for i, doc in enumerate(docs):
-            if not isinstance(doc, str) or not doc.strip():
-                continue
-            # Distance is embedding similarity; lower is better
-            distance = float(distances[i]) if i < len(distances) else 10.0
-            doc_lower = doc.lower()
-            lexical_hits = 0
-            for term in query_term_set:
-                if term in doc_lower:
-                    lexical_hits += 1
-
-            # Higher score is better; semantic dominates, lexical breaks ties.
-            score = (-distance) + (0.15 * lexical_hits)
-            scored_docs.append((score, doc))
-
-        scored_docs = [
-            (s, d)
-            for s, d in scored_docs
-            if s > -0.25  # stricter threshold
-        ]
-
-        scored_docs.sort(key=lambda item: item[0], reverse=True)
-        top_docs = [doc for _, doc in scored_docs[:2]]
-        rag_context = "\n".join(top_docs)
-    except Exception:
+    except Exception as exc:
+        print(f"[RAG] ❌ Exception: {exc}")
         rag_context = ""
 
+    print(f"[RAG] Query: {transcript!r}")
+    print(f"[RAG] Raw distances: {list(zip(docs, distances))}")
+    print(f"[RAG] Top docs after filter: {top_docs}")
     return {"rag_context": rag_context}
 
 
@@ -372,7 +519,7 @@ def _classify_intent(transcript: str, tool_results: list) -> dict:
 Classify the user message into exactly one primary intent:
 - "casual": pure greeting or small talk only (bonjour, merci, ok, au revoir, bonsoir)
 - "tool": user asks about THEIR personal account data (mon solde, mon compte, mes paiements, impayé, mon échéancier, mes transactions) — even if combined with a greeting
-- "rag": user asks about banking concepts, product definitions, general banking rules (qu'est-ce que, comment fonctionne, définition, avantages de)
+- "rag": user asks about banking concepts, product definitions, general banking rules, or legal banking notions (qu'est-ce que, comment fonctionne, définition, avantages de, mise en demeure, lettre de change, chèque sans provision, traite, billet à ordre, prescription, force majeure, résiliation, clause pénale, intérêts de retard, recouvrement, dette, créance, saisie, caution, gage, hypothèque)
 - "general": any other banking or financial question the LLM can answer from knowledge
 
 For "tool", also detect which tool: "mock_account_lookup" for balance/account/arrears, "mock_payment_plan" for payment plans/installments.
@@ -389,6 +536,8 @@ Examples:
 "Quel est mon solde?" → {"primary":"tool","tool_name":"mock_account_lookup","secondary":null}
 "Bonjour, quel est mon solde?" → {"primary":"tool","tool_name":"mock_account_lookup","secondary":"casual"}
 "Comment fonctionne un virement?" → {"primary":"rag","tool_name":null,"secondary":null}
+"C'est quoi une mise en demeure?" → {"primary":"rag","tool_name":null,"secondary":null}
+"Quels sont les délais de prescription?" → {"primary":"rag","tool_name":null,"secondary":null}
 "C'est quoi un taux d'intérêt?" → {"primary":"general","tool_name":null,"secondary":null}
 "Je veux payer en 3 fois" → {"primary":"tool","tool_name":"mock_payment_plan","secondary":null}
 """
@@ -700,56 +849,107 @@ def build_voice_agent_graph():
 
 
 def seed_chroma() -> None:
-    """Seed Chroma from banque.pdf with chunking + Ollama embeddings."""
+    """Seed Chroma from all legal PDFs in rag_docs/ with structured metadata."""
 
     collection = _get_chroma_collection()
 
     project_root = Path(__file__).resolve().parents[1]
-    pdf_path = Path(os.environ.get("VOICE_AGENT_RAG_PDF", project_root / "banque.pdf"))
-    if not pdf_path.exists():
+    docs_dir = project_root / "rag_docs"
+    if not docs_dir.exists() or not docs_dir.is_dir():
+        print("[SEED] ❌ rag_docs/ introuvable")
         return
 
-    source_key = str(pdf_path.resolve())
-
-    # Avoid duplicate ingestion for the same source.
-    try:
-        existing = collection.get(where={"source": source_key}, include=[])
-        if existing and existing.get("ids"):
-            return
-    except Exception:
-        pass
-
-    text = _extract_pdf_text(pdf_path)
-    if not text:
+    pdf_paths = sorted(docs_dir.glob("*.pdf"))
+    if not pdf_paths:
+        print("[SEED] ❌ Aucun PDF trouvé")
         return
 
-    chunk_size = int(os.environ.get("VOICE_AGENT_RAG_CHUNK_SIZE", "900"))
-    chunk_overlap = int(os.environ.get("VOICE_AGENT_RAG_CHUNK_OVERLAP", "150"))
-    chunks = _chunk_text(text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    if not chunks:
-        return
+    BATCH_SIZE = 8  # Small batches — Ollama embedding one-by-one is slow but safe
 
-    ids = [f"banque_pdf_chunk_{i:05d}" for i in range(1, len(chunks) + 1)]
-    metadatas = [
-        {
-            "source": source_key,
-            "source_name": pdf_path.name,
-            "chunk_index": i,
-            "chunk_total": len(chunks),
-        }
-        for i in range(len(chunks))
-    ]
+    for pdf_path in pdf_paths:
+        source_key = str(pdf_path.resolve())
+        print(f"[SEED] Traitement: {pdf_path.name}")
 
-    try:
-        collection.add(ids=ids, documents=chunks, metadatas=metadatas)
-    except Exception:
-        # Seeding must not block app startup.
-        return
+        try:
+            existing = collection.get(where={"source": source_key}, include=[])
+            if existing and existing.get("ids"):
+                print(
+                    f"[SEED] ⏭ Déjà ingéré: {pdf_path.name} ({len(existing['ids'])} chunks)"
+                )
+                continue
+        except Exception as e:
+            print(f"[SEED] ⚠ Check existant échoué (ok): {e}")
+
+        text = _extract_pdf_text(pdf_path)
+        if not text:
+            print(f"[SEED] ❌ Pas de texte: {pdf_path.name}")
+            continue
+        print(f"[SEED] ✓ Texte: {len(text)} chars")
+
+        chunks = chunk_legal_pdf(text)
+        if not chunks:
+            print(f"[SEED] ❌ Pas de chunks: {pdf_path.name}")
+            continue
+        print(f"[SEED] ✓ Chunks: {len(chunks)}")
+
+        filename = pdf_path.stem
+        filename_norm = filename.lower()
+        if "obligations" in filename_norm:
+            code = "COC"
+        elif "commerce" in filename_norm:
+            code = "COMMERCE"
+        else:
+            code = "UNKNOWN"
+
+        filename_id = re.sub(r"[^a-zA-Z0-9_]+", "_", filename)
+
+        ids, documents, metadatas = [], [], []
+        for index, chunk in enumerate(chunks, start=1):
+            chunk_text = chunk.get("text", "").strip()
+            if not chunk_text:
+                continue
+            article = str(chunk.get("article", "unknown"))
+            ids.append(f"{filename_id}_article_{article}_{index}")
+            documents.append(chunk_text)
+            metadatas.append(
+                {
+                    "source": source_key,
+                    "source_name": pdf_path.name,
+                    "article": article,
+                    "type": chunk.get("type", "article"),
+                    "code": code,
+                }
+            )
+
+        total = len(ids)
+        ingested = 0
+        failed = 0
+
+        for batch_start in range(0, total, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, total)
+            b_ids = ids[batch_start:batch_end]
+            b_docs = documents[batch_start:batch_end]
+            b_meta = metadatas[batch_start:batch_end]
+
+            try:
+                collection.add(ids=b_ids, documents=b_docs, metadatas=b_meta)
+                ingested += len(b_ids)
+                print(
+                    f"[SEED]   ✓ batch {batch_start}–{batch_end} ({ingested}/{total})"
+                )
+            except Exception as exc:
+                failed += len(b_ids)
+                print(f"[SEED]   ❌ batch {batch_start}–{batch_end} ERREUR: {exc}")
+                print(f"[SEED]      premier doc: {b_docs[0][:80]!r}")
+
+        print(f"[SEED] {pdf_path.name}: {ingested} ingérés, {failed} échoués")
+
+    final = collection.count()
+    print(f"\n[SEED] ✅ TOTAL collection: {final} chunks")
 
 
 # Compile once at module level — not inside run_voice_agent_turn()
 _app = build_voice_agent_graph()
-seed_chroma()
 
 
 def run_voice_agent_turn(transcript: str) -> AgentState:
