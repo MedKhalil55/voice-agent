@@ -1,11 +1,14 @@
 # check_chroma.py
 from dotenv import load_dotenv
+
 load_dotenv(override=True)
 
 import os, chromadb, requests
 
 chroma_path = os.environ.get("VOICE_AGENT_CHROMA_PATH", "artifacts/chroma")
-collection_name = os.environ.get("VOICE_AGENT_CHROMA_COLLECTION", "voice_agent_docs_nomic")
+collection_name = os.environ.get(
+    "VOICE_AGENT_CHROMA_COLLECTION", "voice_agent_docs_nomic"
+)
 ollama_url = os.environ.get("VOICE_AGENT_OLLAMA_BASE_URL", "http://localhost:11434")
 embed_model = os.environ.get("VOICE_AGENT_EMBED_MODEL", "nomic-embed-text")
 
@@ -38,11 +41,14 @@ print(f"Query vector length: {len(vec)}")
 
 # 3. Try ChromaDB query with the embedding fn
 from llm.langgraph_agent import _get_chroma_collection
+
 collection = _get_chroma_collection()
-print(f"\nCollection via _get_chroma_collection(): {collection.name}, count={collection.count()}")
+print(
+    f"\nCollection via _get_chroma_collection(): {collection.name}, count={collection.count()}"
+)
 
 result = collection.query(
-    query_texts=["mineur contrat"],
+    query_embeddings=[vec],
     n_results=3,
     include=["documents", "distances"],
 )

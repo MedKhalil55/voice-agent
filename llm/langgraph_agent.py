@@ -271,17 +271,72 @@ def _hybrid_score(
     if not docs:
         return []
 
-    # Hard cap: drop any doc with cosine distance above 0.28
-    pairs = [(d, dist) for d, dist in zip(docs, distances) if float(dist) < 0.25]
-    if not pairs:
-        return []
-    docs, distances = zip(*pairs)
-    docs, distances = list(docs), list(distances)
+    import unicodedata
+
+    # Keep docs, distances, and metadatas aligned while applying distance caps.
+    aligned: list[tuple[str, float, dict]] = []
+    for i, doc in enumerate(docs):
+        distance = float(distances[i]) if i < len(distances) else 1.0
+        meta = (metadatas[i] if metadatas and i < len(metadatas) else {}) or {}
+        aligned.append((doc, distance, meta))
+
+    # Prefer very close matches first; relax cap if it would otherwise return nothing.
+    capped = [row for row in aligned if row[1] < 0.25]
+    if not capped:
+        capped = [row for row in aligned if row[1] < 0.32]
+    if not capped:
+        capped = sorted(aligned, key=lambda row: row[1])[:3]
+
+    docs = [row[0] for row in capped]
+    distances = [row[1] for row in capped]
+    metadatas = [row[2] for row in capped]
 
     from rank_bm25 import BM25Okapi
 
-    query_tokens = (query or "").lower().split()
-    tokenized_docs = [(doc or "").lower().split() for doc in docs]
+    def _tokenize(text: str) -> list[str]:
+        normalized = unicodedata.normalize(
+            "NFKD", (text or "").lower().replace("�", " ")
+        )
+        normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+        return re.findall(r"[a-z0-9]+", normalized)
+
+    query_tokens = _tokenize(query)
+    tokenized_docs = [_tokenize(doc) for doc in docs]
+
+    stopwords = {
+        "le",
+        "la",
+        "les",
+        "de",
+        "des",
+        "du",
+        "un",
+        "une",
+        "et",
+        "ou",
+        "en",
+        "au",
+        "aux",
+        "a",
+        "est",
+        "que",
+        "qui",
+        "quoi",
+        "qu",
+        "comment",
+        "c",
+        "ce",
+        "cela",
+    }
+    query_terms = {tok for tok in query_tokens if tok and tok not in stopwords}
+    query_stems = {tok[:6] for tok in query_terms if len(tok) >= 4}
+    doc_stem_sets = [
+        {tok[:6] for tok in tokens if len(tok) >= 4} for tokens in tokenized_docs
+    ]
+    stem_doc_freq = {
+        stem: sum(1 for stems in doc_stem_sets if stem in stems) for stem in query_stems
+    }
+    total_stem_weight = sum(1.0 / max(1, stem_doc_freq[stem]) for stem in query_stems)
 
     if any(tokenized_docs):
         bm25 = BM25Okapi(tokenized_docs)
@@ -291,7 +346,7 @@ def _hybrid_score(
 
     max_bm25 = max(float(score) for score in bm25_scores) if len(bm25_scores) else 0.0
 
-    scored: list[tuple[float, str]] = []
+    scored: list[tuple[float, str, str]] = []
     for i, doc in enumerate(docs):
         distance = float(distances[i]) if i < len(distances) else 1.0
         cosine_component = 1.0 - distance
@@ -301,32 +356,71 @@ def _hybrid_score(
         if cosine_component < 0.70:
             bm25_norm *= 0.3
 
-        hybrid = (0.75 * cosine_component) + (0.25 * bm25_norm)
-        scored.append((hybrid, doc))
+        doc_terms = set(tokenized_docs[i]) if i < len(tokenized_docs) else set()
+        doc_stems = doc_stem_sets[i] if i < len(doc_stem_sets) else set()
+
+        term_overlap = (
+            (len(query_terms & doc_terms) / float(len(query_terms)))
+            if query_terms
+            else 0.0
+        )
+        stem_overlap = (
+            (len(query_stems & doc_stems) / float(len(query_stems)))
+            if query_stems
+            else term_overlap
+        )
+
+        weighted_stem_overlap = 0.0
+        if query_stems and total_stem_weight > 0.0:
+            weighted_stem_overlap = (
+                sum(
+                    (1.0 / max(1, stem_doc_freq[stem]))
+                    for stem in query_stems
+                    if stem in doc_stems
+                )
+                / total_stem_weight
+            )
+
+        lexical_overlap = max(term_overlap, stem_overlap, weighted_stem_overlap)
+
+        hybrid = (
+            (0.75 * cosine_component) + (0.25 * bm25_norm) + (0.12 * lexical_overlap)
+        )
+        if query_stems and stem_overlap == 0.0:
+            hybrid -= 0.05
+
+        article_id = str((metadatas[i] or {}).get("article", "unknown"))
+        scored.append((hybrid, doc, article_id))
 
     scored.sort(key=lambda item: item[0], reverse=True)
 
-    # Deduplicate by article number: keep only the highest-scoring chunk per article
-    if metadatas:
-        seen_articles: set[str] = set()
-        deduped: list[tuple[float, str]] = []
-        for (score, doc), meta in zip(
-            scored,
-            [metadatas[docs.index(d)] for _, d in scored]
-            if metadatas
-            else [{}] * len(scored),
-        ):
-            article_id = (meta or {}).get("article", "unknown")
-            if article_id not in seen_articles:
-                seen_articles.add(article_id)
-                deduped.append((score, doc))
-        scored = deduped
+    deduped: list[tuple[float, str]] = []
 
-    filtered = [doc for score, doc in scored if score > 0.50][:2]
+    # Deduplicate by article number only when article metadata is present.
+    has_article_metadata = any(
+        (meta or {}).get("article") for meta in (metadatas or [])
+    )
+    if has_article_metadata:
+        seen_articles: set[str] = set()
+        for idx, (score, doc, article_id) in enumerate(scored):
+            key = (
+                article_id if article_id and article_id != "unknown" else f"__idx_{idx}"
+            )
+            if key in seen_articles:
+                continue
+            seen_articles.add(key)
+            deduped.append((score, doc))
+    else:
+        deduped = [(score, doc) for score, doc, _ in scored]
+
+    filtered = [doc for score, doc in deduped if score > 0.45][:2]
     if filtered:
         return filtered
 
-    return [scored[0][1]]
+    if deduped:
+        return [deduped[0][1]]
+
+    return []
 
 
 def _retrieve_node(state: AgentState) -> AgentState:
@@ -348,7 +442,7 @@ def _retrieve_node(state: AgentState) -> AgentState:
 
         result = collection.query(
             query_embeddings=[query_vec],
-            n_results=10,
+            n_results=40,
             include=["documents", "distances", "metadatas"],
         )
         docs = (result.get("documents") or [[]])[0]
