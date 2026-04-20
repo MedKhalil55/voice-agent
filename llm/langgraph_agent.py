@@ -270,157 +270,81 @@ def _hybrid_score(
     distances: list[float],
     metadatas: list[dict] | None = None,
 ) -> list[str]:
-    """Rank docs with a cosine/BM25 hybrid score and return top filtered docs."""
+    """Rank docs with cosine + BM25 hybrid score and return top filtered docs."""
 
     if not docs:
         return []
 
     import unicodedata
+    from rank_bm25 import BM25Okapi
 
-    # Keep docs, distances, and metadatas aligned while applying distance caps.
+    # --- Step 1: filter by distance cap ---
     aligned: list[tuple[str, float, dict]] = []
     for i, doc in enumerate(docs):
         distance = float(distances[i]) if i < len(distances) else 1.0
         meta = (metadatas[i] if metadatas and i < len(metadatas) else {}) or {}
         aligned.append((doc, distance, meta))
 
-    # Prefer very close matches first; relax cap if it would otherwise return nothing.
-    capped = [row for row in aligned if row[1] < 0.25]
+    # Keep only docs within distance threshold
+    capped = [row for row in aligned if row[1] < 0.22]
     if not capped:
-        capped = [row for row in aligned if row[1] < 0.32]
+        capped = [row for row in aligned if row[1] < 0.28]
     if not capped:
         capped = sorted(aligned, key=lambda row: row[1])[:3]
 
-    docs = [row[0] for row in capped]
-    distances = [row[1] for row in capped]
-    metadatas = [row[2] for row in capped]
+    docs_f = [row[0] for row in capped]
+    distances_f = [row[1] for row in capped]
+    metadatas_f = [row[2] for row in capped]
 
-    from rank_bm25 import BM25Okapi
-
+    # --- Step 2: BM25 scoring ---
     def _tokenize(text: str) -> list[str]:
         normalized = unicodedata.normalize(
-            "NFKD", (text or "").lower().replace("�", " ")
+            "NFKD", (text or "").lower().replace("", " ")
         )
         normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
         return re.findall(r"[a-z0-9]+", normalized)
 
     query_tokens = _tokenize(query)
-    tokenized_docs = [_tokenize(doc) for doc in docs]
-
-    stopwords = {
-        "le",
-        "la",
-        "les",
-        "de",
-        "des",
-        "du",
-        "un",
-        "une",
-        "et",
-        "ou",
-        "en",
-        "au",
-        "aux",
-        "a",
-        "est",
-        "que",
-        "qui",
-        "quoi",
-        "qu",
-        "comment",
-        "c",
-        "ce",
-        "cela",
-    }
-    query_terms = {tok for tok in query_tokens if tok and tok not in stopwords}
-    query_stems = {tok[:6] for tok in query_terms if len(tok) >= 4}
-    doc_stem_sets = [
-        {tok[:6] for tok in tokens if len(tok) >= 4} for tokens in tokenized_docs
-    ]
-    stem_doc_freq = {
-        stem: sum(1 for stems in doc_stem_sets if stem in stems) for stem in query_stems
-    }
-    total_stem_weight = sum(1.0 / max(1, stem_doc_freq[stem]) for stem in query_stems)
+    tokenized_docs = [_tokenize(doc) for doc in docs_f]
 
     if any(tokenized_docs):
         bm25 = BM25Okapi(tokenized_docs)
-        bm25_scores = bm25.get_scores(query_tokens)
+        bm25_scores = list(bm25.get_scores(query_tokens))
     else:
-        bm25_scores = [0.0] * len(docs)
+        bm25_scores = [0.0] * len(docs_f)
 
-    max_bm25 = max(float(score) for score in bm25_scores) if len(bm25_scores) else 0.0
+    max_bm25 = max(bm25_scores) if bm25_scores else 0.0
 
+    # --- Step 3: hybrid score (cosine is primary, BM25 is secondary) ---
     scored: list[tuple[float, str, str]] = []
-    for i, doc in enumerate(docs):
-        distance = float(distances[i]) if i < len(distances) else 1.0
-        cosine_component = 1.0 - distance
+    for i, doc in enumerate(docs_f):
+        cosine_component = 1.0 - float(distances_f[i])
+        bm25_norm = (bm25_scores[i] / max_bm25) if max_bm25 > 0.0 else 0.0
 
-        bm25_raw = float(bm25_scores[i]) if i < len(bm25_scores) else 0.0
-        bm25_norm = (bm25_raw / max_bm25) if max_bm25 > 0.0 else 0.0
-        if cosine_component < 0.70:
-            bm25_norm *= 0.3
+        # Cosine is the primary signal - BM25 only breaks ties
+        hybrid = (0.85 * cosine_component) + (0.15 * bm25_norm)
 
-        doc_terms = set(tokenized_docs[i]) if i < len(tokenized_docs) else set()
-        doc_stems = doc_stem_sets[i] if i < len(doc_stem_sets) else set()
-
-        term_overlap = (
-            (len(query_terms & doc_terms) / float(len(query_terms)))
-            if query_terms
-            else 0.0
-        )
-        stem_overlap = (
-            (len(query_stems & doc_stems) / float(len(query_stems)))
-            if query_stems
-            else term_overlap
-        )
-
-        weighted_stem_overlap = 0.0
-        if query_stems and total_stem_weight > 0.0:
-            weighted_stem_overlap = (
-                sum(
-                    (1.0 / max(1, stem_doc_freq[stem]))
-                    for stem in query_stems
-                    if stem in doc_stems
-                )
-                / total_stem_weight
-            )
-
-        lexical_overlap = max(term_overlap, stem_overlap, weighted_stem_overlap)
-
-        hybrid = (
-            (0.75 * cosine_component) + (0.25 * bm25_norm) + (0.12 * lexical_overlap)
-        )
-        if query_stems and stem_overlap == 0.0:
-            hybrid -= 0.05
-
-        article_id = str((metadatas[i] or {}).get("article", "unknown"))
+        article_id = str((metadatas_f[i] or {}).get("article", f"__idx_{i}"))
         scored.append((hybrid, doc, article_id))
 
     scored.sort(key=lambda item: item[0], reverse=True)
 
+    # --- Step 4: deduplicate by article, keeping highest-scored chunk per article ---
+    seen_articles: set[str] = set()
     deduped: list[tuple[float, str]] = []
+    for score, doc, article_id in scored:
+        if article_id in seen_articles:
+            continue
+        seen_articles.add(article_id)
+        deduped.append((score, doc))
 
-    # Deduplicate by article number only when article metadata is present.
-    has_article_metadata = any(
-        (meta or {}).get("article") for meta in (metadatas or [])
-    )
-    if has_article_metadata:
-        seen_articles: set[str] = set()
-        for idx, (score, doc, article_id) in enumerate(scored):
-            key = (
-                article_id if article_id and article_id != "unknown" else f"__idx_{idx}"
-            )
-            if key in seen_articles:
-                continue
-            seen_articles.add(key)
-            deduped.append((score, doc))
-    else:
-        deduped = [(score, doc) for score, doc, _ in scored]
-
-    filtered = [doc for score, doc in deduped if score > 0.45][:2]
+    # --- Step 5: return top 2 docs above minimum score threshold ---
+    MIN_SCORE = 0.72  # cosine distance < 0.22 -> cosine_component > 0.78 minimum
+    filtered = [doc for score, doc in deduped if score > MIN_SCORE][:2]
     if filtered:
         return filtered
 
+    # Fallback: return best match even if below threshold
     if deduped:
         return [deduped[0][1]]
 
@@ -616,6 +540,14 @@ def _classify_intent(transcript: str, tool_results: list) -> dict:
         "ma dette",
         "mes transactions",
         "mon relevé",
+        "mon numéro",
+        "numéro de téléphone",
+        "telephone",
+        "téléphone",
+        "mon email",
+        "mon e-mail",
+        "adresse email",
+        "adresse mail",
     )
     PAYMENT_KW = (
         "plan de paiement",
@@ -647,7 +579,7 @@ def _classify_intent(transcript: str, tool_results: list) -> dict:
 
 Classify the user message into exactly one primary intent:
 - "casual": pure greeting or small talk only (bonjour, merci, ok, au revoir, bonsoir)
-- "tool": user asks about THEIR personal account data (mon solde, mon compte, mes paiements, impayé, mon échéancier, mes transactions) — even if combined with a greeting
+- "tool": user asks about THEIR personal account data (mon solde, mon compte, mes paiements, impayé, mon échéancier, mes transactions, mon numéro de téléphone, mon email) - even if combined with a greeting
 - "rag": user asks about banking concepts, product definitions, general banking rules, or legal banking notions (qu'est-ce que, comment fonctionne, définition, avantages de, mise en demeure, lettre de change, chèque sans provision, traite, billet à ordre, prescription, force majeure, résiliation, clause pénale, intérêts de retard, recouvrement, dette, créance, saisie, caution, gage, hypothèque)
 - "general": any other banking or financial question the LLM can answer from knowledge
 
@@ -669,6 +601,8 @@ Examples:
 "Quels sont les délais de prescription?" → {"primary":"rag","tool_name":null,"secondary":null}
 "C'est quoi un taux d'intérêt?" → {"primary":"general","tool_name":null,"secondary":null}
 "Je veux payer en 3 fois" → {"primary":"tool","tool_name":"mock_payment_plan","secondary":null}
+"Quel est mon numéro de téléphone?" → {"primary":"tool","tool_name":"mock_account_lookup","secondary":null}
+"Donne-moi mon email" → {"primary":"tool","tool_name":"mock_account_lookup","secondary":null}
 """
 
     user_prompt = f"User message: {transcript}\nReturn JSON only."
@@ -723,6 +657,12 @@ Examples:
             "compte",
             "impay",
             "dette",
+            "telephone",
+            "téléphone",
+            "numero",
+            "numéro",
+            "email",
+            "mail",
         )
         payment_markers = (
             "echeancier",

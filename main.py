@@ -66,6 +66,40 @@ def format_phone_tunisian(phone: str | int | None) -> str:
     return " ".join(digits[i : i + 2] for i in range(0, len(digits), 2))
 
 
+def _tts_phone_digits_grouped(phone: str | int | None) -> str:
+    """Render Tunisian phone number as grouped digits for robust TTS.
+
+    Example:
+    21673445566 -> "2 1 6, 7 3, 4 4 5, 5 6 6"
+    """
+
+    if phone is None:
+        return ""
+
+    digits = re.sub(r"\D", "", str(phone))
+    groups: list[str]
+    if digits.startswith("216") and len(digits) == 11:
+        groups = [digits[0:3], digits[3:5], digits[5:8], digits[8:11]]
+    elif len(digits) == 8:
+        groups = [digits[0:2], digits[2:5], digits[5:8]]
+    else:
+        groups = [digits[i : i + 2] for i in range(0, len(digits), 2)]
+
+    return ", ".join(" ".join(ch for ch in group) for group in groups if group)
+
+
+def normalize_tunisian_phones_in_text(text: str) -> str:
+    """Normalize Tunisian phone numbers found in free text before TTS."""
+
+    pattern = re.compile(r"(?<!\d)(?:\+?216[\s\-\.]?)((?:\d[\s\-\.]?){7}\d)(?!\d)")
+
+    def _repl(match: re.Match[str]) -> str:
+        local_digits = re.sub(r"\D", "", match.group(1))
+        return _tts_phone_digits_grouped(f"216{local_digits}")
+
+    return pattern.sub(_repl, text)
+
+
 def clean_for_tts(text: str) -> str:
     """Post-process text to sound natural when spoken.
 
@@ -78,6 +112,9 @@ def clean_for_tts(text: str) -> str:
     value = (text or "").strip()
     if not value:
         return ""
+
+    # Normalize Tunisian phone numbers so TTS reads them as grouped numbers.
+    value = normalize_tunisian_phones_in_text(value)
 
     # Normalize line endings first.
     value = value.replace("\r\n", "\n").replace("\r", "\n")
@@ -409,6 +446,8 @@ class VoiceAgent:
                     "Tu as accès au dossier complet du client. "
                     "Réponds UNIQUEMENT à la question posée par le client, en utilisant "
                     "les données exactes de son dossier. "
+                    "Ne donne qu'une seule information si le client demande une seule information. "
+                    "N'ajoute jamais des détails non demandés (pas de numéro de compte, pas de téléphone, pas d'email, pas de solde) sauf si la question le demande explicitement. "
                     "Ne parle des impayés QUE si le client pose une question sur ses impayés, "
                     "son solde, ou son compte. "
                     "Si le client demande son numéro de téléphone, donne-lui son numéro. "
@@ -435,7 +474,7 @@ class VoiceAgent:
                     f"- Montant total du prêt: {client.get('apply_amount_total', 0)} DT\n"
                     f"- Durée du prêt: {client.get('term_period', 0)} mois\n"
                     f"- Statut workflow: {client.get('statut_workflow', '')}\n\n"
-                    f"Réponds à la question en utilisant uniquement les données pertinentes."
+                    f"Réponds uniquement à la question demandée. N'ajoute aucune donnée non demandée."
                 )
                 if user_msg_override is not None:
                     user_msg = user_msg_override
