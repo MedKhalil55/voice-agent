@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -43,6 +44,26 @@ OUTBOUND_GREETING = (
 
 def _log(message: str) -> None:
     print(f"[{strftime('%H:%M:%S')}] {message}")
+
+
+def format_phone_tunisian(phone: str | int | None) -> str:
+    """Formate un numero tunisien pour la lecture TTS.
+
+    '21623766755' -> '216 23 766 755'
+    On cible le format 216 + 2 chiffres + 3 chiffres + 3 chiffres.
+    """
+
+    if phone is None:
+        return ""
+    digits = re.sub(r"\D", "", str(phone))
+    if digits.startswith("216") and len(digits) == 11:
+        cc = digits[0:3]  # 216
+        p1 = digits[3:5]  # 23
+        p2 = digits[5:8]  # 766
+        p3 = digits[8:11]  # 755
+        return f"{cc} {p1} {p2} {p3}"
+    # fallback : groupes de 2
+    return " ".join(digits[i : i + 2] for i in range(0, len(digits), 2))
 
 
 def clean_for_tts(text: str) -> str:
@@ -139,6 +160,10 @@ class VoiceAgent:
         # On Windows/PowerShell, environment variables may already be set in the
         # session. We want `.env` to take precedence.
         load_dotenv(override=True)
+        # Change this value to test with different customers
+        self._customer_id: int = int(os.environ.get("VOICE_AGENT_CUSTOMER_ID", 1002))
+        self._session_id: str = str(uuid.uuid4())
+        self._turn_number: int = 0
 
         self._shutdown_event = Event()
         self._processing_lock = Lock()
@@ -301,9 +326,11 @@ class VoiceAgent:
             t0 = _time.monotonic()
             first_audio_time = None
             full_response_parts = []
+            self._turn_number += 1
+            current_turn = self._turn_number
 
             # Prepare context via LangGraph (decision + RAG + tools only).
-            state = run_voice_agent_prepare(user_text)
+            state = run_voice_agent_prepare(user_text, customer_id=self._customer_id)
             print(
                 f"[RAG DEBUG] rag_context: {repr(state.get('rag_context', '')[:300])}"
             )
@@ -378,15 +405,37 @@ class VoiceAgent:
                     return
                 greeting = "Bien sûr ! " if secondary == "casual" else ""
                 system_msg = (
-                    "Parle comme un conseiller bancaire humain au téléphone. "
-                    "Utilise un ton naturel, simple, et direct. "
-                    "Évite les définitions académiques."
+                    "Tu es un agent de recouvrement bancaire tunisien au téléphone. "
+                    "Tu as accès au dossier complet du client. "
+                    "Réponds UNIQUEMENT à la question posée par le client, en utilisant "
+                    "les données exactes de son dossier. "
+                    "Ne parle des impayés QUE si le client pose une question sur ses impayés, "
+                    "son solde, ou son compte. "
+                    "Si le client demande son numéro de téléphone, donne-lui son numéro. "
+                    "Si le client demande son email, donne-lui son email. "
+                    "Le numéro de téléphone est déjà formaté avec des espaces, "
+                    "lis-le chiffre par chiffre en respectant les groupes : "
+                    "'216 23 766 755' se lit 'deux cent seize, vingt-trois, sept cent soixante-six, sept cent cinquante-cinq'. "
+                    "Sois naturel, direct, et concis. Maximum 2 phrases."
                 )
+                client = tool_res[0] if tool_res else {}
                 user_msg = (
-                    f"{'Commence par: ' + greeting if greeting else ''}"
-                    f"Question: {state['transcript']}\n"
-                    f"Données: {tool_res}\n"
-                    f"Réponse naturelle:"
+                    f"{'Bonjour ' + client.get('customer_name', '') + '. ' if greeting else ''}"
+                    f"Question du client: {state['transcript']}\n\n"
+                    f"Dossier complet du client:\n"
+                    f"- Nom: {client.get('customer_name', '')}\n"
+                    f"- Téléphone: {format_phone_tunisian(client.get('telephone_1', ''))}\n"
+                    f"- Email: {client.get('email', '')}\n"
+                    f"- Numéro de compte: {client.get('account_number', '')}\n"
+                    f"- Statut client: {client.get('customer_status', '')}\n"
+                    f"- Montant impayé: {client.get('unpaid_amount', 0)} DT\n"
+                    f"- Jours de retard: {client.get('late_days', 0)} jours\n"
+                    f"- Mensualités impayées: {client.get('number_of_unpaid_installment', 0)}\n"
+                    f"- Mensualité normale: {client.get('normal_payment', 0)} DT\n"
+                    f"- Montant total du prêt: {client.get('apply_amount_total', 0)} DT\n"
+                    f"- Durée du prêt: {client.get('term_period', 0)} mois\n"
+                    f"- Statut workflow: {client.get('statut_workflow', '')}\n\n"
+                    f"Réponds à la question en utilisant uniquement les données pertinentes."
                 )
                 if user_msg_override is not None:
                     user_msg = user_msg_override
@@ -455,6 +504,21 @@ class VoiceAgent:
 
             assistant_text = " ".join(full_response_parts)
             _log(f"Assistant: {assistant_text!r}")
+
+            try:
+                from db.tools import log_call
+
+                log_call(
+                    customer_id=state.get("customer_id") or self._customer_id,
+                    transcript=user_text,
+                    intent=route,
+                    outcome="completed",
+                    agent_decision=assistant_text[:500],
+                    session_id=self._session_id,
+                    turn_number=current_turn,
+                )
+            except Exception as log_exc:
+                _log(f"[DB] log_call failed: {log_exc}")
 
             stt_latency = getattr(self._stt, "_last_decode_seconds", 0.0)
             perceived = stt_latency + (first_audio_time or 0.0)

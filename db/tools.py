@@ -105,11 +105,22 @@ def log_call(
     intent: str,
     outcome: str,
     agent_decision: str,
+    session_id: str = "",
+    turn_number: int = 1,
 ) -> dict[str, Any]:
     query = """
     INSERT INTO acm_call_log
-        (customer_id, transcript, intent, outcome, agent_decision, created_by)
-    VALUES (%s, %s, %s, %s, %s, 'VOICE_AGENT')
+        (
+            customer_id,
+            transcript,
+            intent,
+            outcome,
+            agent_decision,
+            session_id,
+            turn_number,
+            created_by
+        )
+    VALUES (%s, %s, %s, %s, %s, %s, %s, 'VOICE_AGENT')
     RETURNING id
     """
 
@@ -119,7 +130,15 @@ def log_call(
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
                     cur.execute(
                         query,
-                        (customer_id, transcript, intent, outcome, agent_decision),
+                        (
+                            customer_id,
+                            transcript,
+                            intent,
+                            outcome,
+                            agent_decision,
+                            session_id,
+                            turn_number,
+                        ),
                     )
                     row = cur.fetchone()
                 conn.commit()

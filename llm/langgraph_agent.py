@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import os
 import re
+from decimal import Decimal
 from pathlib import Path
 from importlib import import_module
 from typing import Dict, List, TypedDict
+
+from db.tools import create_claim, create_payment_promise, get_client_info, log_call
 
 try:
     # Package mode: python -m llm.langgraph_agent
@@ -31,6 +34,7 @@ class AgentState(TypedDict):
     response_text: str
     agent_iterations: int
     tool_call_count: int
+    customer_id: int | None
 
 
 _CHROMA_COLLECTION = None
@@ -804,7 +808,10 @@ def _agent_node(state: AgentState) -> AgentState:
             "tool_calls": [
                 {
                     "name": tool_name,
-                    "args": {"query": transcript},
+                    "args": {
+                        "query": transcript,
+                        "customer_id": state.get("customer_id") or 1002,
+                    },
                 }
             ],
             "response_text": "",
@@ -831,30 +838,75 @@ def _agent_node(state: AgentState) -> AgentState:
     }
 
 
-def _mock_account_lookup(args: Dict) -> Dict:
-    query = args.get("query", "")
-    return {
-        "tool": "mock_account_lookup",
-        "ok": True,
-        "query": query,
-        "account_status": "in_arrears",
-        "outstanding_amount": 2450.0,
-        "next_due_date": "2026-04-05",
-    }
+def _decimal_safe(d: Dict) -> Dict:
+    """Convert Decimal values to float for JSON serialization."""
+    return {k: float(v) if isinstance(v, Decimal) else v for k, v in d.items()}
 
 
-def _mock_payment_plan(args: Dict) -> Dict:
-    requested = args.get("requested_installments", 3)
-    return {
-        "tool": "mock_payment_plan",
-        "ok": True,
-        "approved_installments": max(1, min(int(requested), 6)),
-        "minimum_monthly_amount": 400.0,
-    }
+def _real_account_lookup(args: Dict) -> Dict:
+    customer_id = args.get("customer_id") or args.get("query")
+    try:
+        customer_id = int(customer_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "customer_id invalide"}
+
+    result = _decimal_safe(get_client_info(customer_id))
+    result["ok"] = bool(result.get("found", False))
+    result.setdefault("customer_id", customer_id)
+    result.setdefault("tool", "get_client_info")
+    return result
+
+
+def _real_payment_promise(args: Dict) -> Dict:
+    try:
+        result = create_payment_promise(
+            customer_id=int(args.get("customer_id", 0)),
+            amount=float(args.get("amount", 0)),
+            installments=int(args.get("installments", 1)),
+            promised_date=str(args.get("promised_date", "")),
+        )
+        result["ok"] = bool(result.get("success", False))
+        result.setdefault("tool", "create_payment_promise")
+        return result
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _real_log_call(args: Dict) -> Dict:
+    try:
+        result = log_call(
+            customer_id=int(args.get("customer_id", 0)),
+            transcript=str(args.get("transcript", "")),
+            intent=str(args.get("intent", "")),
+            outcome=str(args.get("outcome", "completed")),
+            agent_decision=str(args.get("agent_decision", ""))[:500],
+        )
+        result["ok"] = bool(result.get("success", False))
+        result.setdefault("tool", "log_call")
+        return result
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _real_create_claim(args: Dict) -> Dict:
+    try:
+        result = create_claim(
+            customer_id=int(args.get("customer_id", 0)),
+            subject=str(args.get("subject", "")),
+            body=str(args.get("body", "")),
+            name=str(args.get("name", "")),
+            phone=str(args.get("phone", "")),
+            email=str(args.get("email", "")),
+        )
+        result["ok"] = bool(result.get("success", False))
+        result.setdefault("tool", "create_claim")
+        return result
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def _tool_executor_node(state: AgentState) -> AgentState:
-    """Execute mock tools listed in state.tool_calls."""
+    """Execute tools listed in state.tool_calls."""
 
     tool_calls = state.get("tool_calls") or []
     if not tool_calls:
@@ -864,13 +916,16 @@ def _tool_executor_node(state: AgentState) -> AgentState:
         }
 
     tools = {
-        "mock_account_lookup": _mock_account_lookup,
-        "mock_payment_plan": _mock_payment_plan,
-        # Accept common LLM aliases for the same mock tools.
-        "get_account_lookup": _mock_account_lookup,
-        "get_client_info": _mock_account_lookup,
-        "get_payment_plan": _mock_payment_plan,
-        "get_arrears": _mock_account_lookup,
+        "get_client_info": _real_account_lookup,
+        "mock_account_lookup": _real_account_lookup,
+        "create_payment_promise": _real_payment_promise,
+        "mock_payment_plan": _real_payment_promise,
+        "log_call": _real_log_call,
+        "create_claim": _real_create_claim,
+        # Accept common aliases for compatibility.
+        "get_account_lookup": _real_account_lookup,
+        "get_payment_plan": _real_payment_promise,
+        "get_arrears": _real_account_lookup,
     }
 
     results: List[Dict] = []
@@ -888,14 +943,14 @@ def _tool_executor_node(state: AgentState) -> AgentState:
                 or "client" in normalized
                 or "account" in normalized
             ):
-                tool_fn = _mock_account_lookup
+                tool_fn = _real_account_lookup
             elif (
                 "payment" in normalized
                 or "plan" in normalized
                 or "mensual" in normalized
                 or "echeancier" in normalized
             ):
-                tool_fn = _mock_payment_plan
+                tool_fn = _real_payment_promise
 
         if tool_fn is None:
             results.append(
@@ -1087,11 +1142,12 @@ def run_voice_agent_turn(transcript: str) -> AgentState:
         "response_text": "",
         "agent_iterations": 0,
         "tool_call_count": 0,
+        "customer_id": 1002,
     }
     return _app.invoke(initial_state, config={"recursion_limit": 10})
 
 
-def run_voice_agent_prepare(transcript: str) -> dict:
+def run_voice_agent_prepare(transcript: str, customer_id: int = 1002) -> dict:
     # CRITICAL: intent must be computed once to avoid latency explosion
     intent = _classify_intent(transcript, [])
     initial_state: AgentState = {
@@ -1103,13 +1159,15 @@ def run_voice_agent_prepare(transcript: str) -> dict:
         "response_text": "",
         "agent_iterations": 0,
         "tool_call_count": 0,
+        "customer_id": customer_id,
     }
     result = _app.invoke(initial_state, config={"recursion_limit": 10})
     return {
-        "transcript": result.get("transcript", ""),
+        "transcript": transcript,
         "rag_context": result.get("rag_context", ""),
         "tool_results": result.get("tool_results", []),
         "route": intent["primary"],
+        "customer_id": customer_id,
     }
 
 
