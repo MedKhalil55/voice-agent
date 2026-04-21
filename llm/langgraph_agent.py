@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 from importlib import import_module
@@ -723,6 +723,183 @@ def verify_identity(transcript: str, customer_id: int, attempts: int) -> dict:
         "should_hangup": updated_attempts >= 3,
         "extracted_date": extracted_date,
     }
+
+
+def classify_client_profile(client_info: dict) -> dict:
+    late_days = int(client_info.get("late_days") or 0)
+    unpaid_installments = int(client_info.get("number_of_unpaid_installment") or 0)
+    workflow = str(client_info.get("statut_workflow") or "").strip().upper()
+
+    if late_days < 30 or (unpaid_installments <= 1 and workflow == "EN_ATTENTE"):
+        profile = "FIDELE"
+        max_installments = 6
+        tone = "soft"
+        legal_warning = False
+    elif late_days > 90 or workflow == "CONTENTIEUX" or unpaid_installments > 4:
+        profile = "CONTENTIEUX"
+        max_installments = 2
+        tone = "strict"
+        legal_warning = True
+    else:
+        profile = "DIFFICILE"
+        max_installments = 3
+        tone = "firm"
+        legal_warning = False
+
+    unpaid_amount = float(client_info.get("unpaid_amount") or 0.0)
+    suggested_amount = round(unpaid_amount / max_installments, 2)
+
+    today = date.today()
+    if today.month == 12:
+        first_payment_date = date(today.year + 1, 1, 1)
+    else:
+        first_payment_date = date(today.year, today.month + 1, 1)
+
+    return {
+        "profile": profile,
+        "max_installments": max_installments,
+        "tone": tone,
+        "legal_warning": legal_warning,
+        "suggested_amount": suggested_amount,
+        "first_payment_date": first_payment_date.isoformat(),
+    }
+
+
+def extract_payment_date_from_transcript(transcript: str) -> str | None:
+    source = (transcript or "").strip()
+    if not source:
+        return None
+
+    today = date.today()
+
+    def _end_of_month(base: date) -> date:
+        if base.month == 12:
+            next_month = date(base.year + 1, 1, 1)
+        else:
+            next_month = date(base.year, base.month + 1, 1)
+        return next_month - timedelta(days=1)
+
+    def _future_or_current(day_value: int, month_value: int) -> date | None:
+        candidate = _build_date(day_value, month_value, today.year)
+        if candidate is None:
+            return None
+        if candidate < today:
+            candidate = _build_date(day_value, month_value, today.year + 1)
+        return candidate
+
+    # 05/06/2026 or 05-06-2026
+    match = re.search(r"(?<!\d)(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})(?!\d)", source)
+    if match:
+        parsed = _build_date(
+            day=int(match.group(1)),
+            month=int(match.group(2)),
+            year=int(match.group(3)),
+        )
+        if parsed is not None:
+            return parsed.isoformat()
+
+    normalized = _normalize_french_text(source)
+
+    # dans 15 jours
+    match = re.search(r"\bdans\s+(\d{1,3})\s+jours?\b", normalized)
+    if match:
+        days = int(match.group(1))
+        return (today + timedelta(days=days)).isoformat()
+
+    if "semaine prochaine" in normalized:
+        return (today + timedelta(days=7)).isoformat()
+
+    if "fin du mois" in normalized:
+        return _end_of_month(today).isoformat()
+
+    months = {
+        "janvier": 1,
+        "fevrier": 2,
+        "mars": 3,
+        "avril": 4,
+        "mai": 5,
+        "juin": 6,
+        "juillet": 7,
+        "aout": 8,
+        "septembre": 9,
+        "octobre": 10,
+        "novembre": 11,
+        "decembre": 12,
+    }
+    month_alt = "|".join(months.keys())
+
+    # le premier mai
+    match = re.search(rf"\ble\s+premier\s+({month_alt})\b", normalized)
+    if match:
+        parsed = _future_or_current(1, months[match.group(1)])
+        if parsed is not None:
+            return parsed.isoformat()
+
+    # le 15 mai 2026 / le 15 mai
+    match = re.search(
+        rf"\ble\s+(\d{{1,2}})\s+({month_alt})(?:\s+(\d{{4}}))?\b", normalized
+    )
+    if match:
+        day_value = int(match.group(1))
+        month_value = months[match.group(2)]
+        year_raw = match.group(3)
+        if year_raw:
+            parsed = _build_date(day_value, month_value, int(year_raw))
+        else:
+            parsed = _future_or_current(day_value, month_value)
+        if parsed is not None:
+            return parsed.isoformat()
+
+    # le 15
+    match = re.search(r"\ble\s+(\d{1,2})\b", normalized)
+    if match:
+        day_value = int(match.group(1))
+        if today.day <= day_value:
+            parsed = _build_date(day_value, today.month, today.year)
+        else:
+            if today.month == 12:
+                parsed = _build_date(day_value, 1, today.year + 1)
+            else:
+                parsed = _build_date(day_value, today.month + 1, today.year)
+        if parsed is not None:
+            return parsed.isoformat()
+
+    # LLM fallback for hard spoken forms.
+    import json
+
+    prompt = (
+        "Extrait la date de paiement promise depuis cette phrase. "
+        'Réponds uniquement en JSON: {"day": int|null, "month": int|null, "year": int|null}.'
+    )
+
+    raw = (
+        call_llm_raw(
+            [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": source},
+            ],
+            num_predict=64,
+            temperature=0.0,
+        )
+        or ""
+    ).strip()
+
+    try:
+        match = re.search(r"\{.*?\}", raw, flags=re.DOTALL)
+        if not match:
+            return None
+        parsed_json = json.loads(match.group(0))
+        if not isinstance(parsed_json, dict):
+            return None
+        day_value = parsed_json.get("day")
+        month_value = parsed_json.get("month")
+        year_value = parsed_json.get("year")
+        if None in (day_value, month_value, year_value):
+            return None
+        parsed = _build_date(int(day_value), int(month_value), int(year_value))
+        return parsed.isoformat() if parsed is not None else None
+    except Exception:
+        return None
 
 
 def _classify_intent(transcript: str, tool_results: list) -> dict:
