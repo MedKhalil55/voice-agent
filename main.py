@@ -901,13 +901,13 @@ class VoiceAgent:
                 self._proposed_date = (
                     extract_payment_date_from_transcript(user_text) or first_date
                 )
-                self._negotiation_step = "save_promise"
+                self._negotiation_step = "await_confirmation"
                 self._stt.pause()
                 try:
                     counter_ok_msg = (
-                        "D'accord, je valide votre contre-proposition. "
-                        f"Nous retenons {self._proposed_installments} mensualité(s) de "
-                        f"{self._proposed_amount} DT, première échéance le {self._proposed_date}."
+                        f"D'accord, je note votre proposition de {self._proposed_installments} "
+                        f"mensualité(s) de {self._proposed_amount} DT. "
+                        "Confirmez-vous cet engagement ?"
                     )
                     self.speak(counter_ok_msg)
                 finally:
@@ -918,11 +918,6 @@ class VoiceAgent:
                     outcome="counter_accepted",
                     agent_decision=counter_ok_msg,
                     turn_number=turn_number,
-                )
-                self._save_payment_promise(
-                    transcript=user_text,
-                    turn_number=turn_number,
-                    intent="negotiation_counter",
                 )
                 return
 
@@ -1011,6 +1006,10 @@ class VoiceAgent:
                 system_msg = (
                     "Tu es un conseiller bancaire tunisien au téléphone. "
                     "Réponds uniquement à la question posée de manière claire et courte. "
+                    f"Le plan proposé est: {max_inst} mensualités de {suggested} DT, "
+                    f"première échéance le {first_date}. "
+                    "Si le client demande s'il peut payer en X fois et que X <= max_installments, "
+                    "dis oui et confirme le plan. "
                     "Réponds exclusivement en français. Maximum 2 phrases."
                 )
                 answer_user_msg = (

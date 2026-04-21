@@ -735,7 +735,11 @@ def classify_client_profile(client_info: dict) -> dict:
         max_installments = 6
         tone = "soft"
         legal_warning = False
-    elif late_days > 90 or workflow == "CONTENTIEUX" or unpaid_installments > 4:
+    elif (
+        late_days > 90
+        or (workflow == "CONTENTIEUX" and late_days > 60)
+        or unpaid_installments > 4
+    ):
         profile = "CONTENTIEUX"
         max_installments = 2
         tone = "strict"
