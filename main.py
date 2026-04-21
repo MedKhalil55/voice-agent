@@ -30,7 +30,7 @@ from time import strftime
 from dotenv import load_dotenv
 
 from llm import stream_raw_sentences, warmup_llm
-from llm.langgraph_agent import run_voice_agent_prepare
+from llm.langgraph_agent import run_voice_agent_prepare, verify_identity
 from stt import StreamingWhisper, warmup_stt
 from stt.streaming_whisper import VadConfig
 from tts import speak_streaming, warmup_tts
@@ -201,6 +201,9 @@ class VoiceAgent:
         self._customer_id: int = int(os.environ.get("VOICE_AGENT_CUSTOMER_ID", 1002))
         self._session_id: str = str(uuid.uuid4())
         self._turn_number: int = 0
+        self._verified: bool = False
+        self._verification_attempts: int = 0
+        self._awaiting_dob: bool = False
 
         self._shutdown_event = Event()
         self._processing_lock = Lock()
@@ -306,6 +309,15 @@ class VoiceAgent:
         finally:
             self._stt.resume()
 
+        self._stt.pause()
+        try:
+            self.speak(
+                "Pour vérifier votre identité, pouvez-vous me donner votre date de naissance ?"
+            )
+            self._awaiting_dob = True
+        finally:
+            self._stt.resume()
+
         _log("Assistant prêt. Parlez, puis faites une courte pause.")
 
     def handle_partial(self, text: str) -> None:
@@ -359,6 +371,64 @@ class VoiceAgent:
         try:
             _log(f"User: {user_text!r}")
             self._session_summary["turns"].append({"user_text": user_text})
+
+            if not self._verified:
+                if self._awaiting_dob:
+                    verification = verify_identity(
+                        transcript=user_text,
+                        customer_id=self._customer_id,
+                        attempts=self._verification_attempts,
+                    )
+                    self._verification_attempts = int(
+                        verification.get("attempts", self._verification_attempts)
+                    )
+
+                    if verification.get("verified"):
+                        self._verified = True
+                        self._awaiting_dob = False
+                        self._stt.pause()
+                        try:
+                            self.speak(
+                                "Merci, votre identité a bien été vérifiée. Comment puis-je vous aider ?"
+                            )
+                        finally:
+                            self._stt.resume()
+                        return
+
+                    if verification.get("should_hangup"):
+                        self._stt.pause()
+                        try:
+                            self.speak(
+                                "Je suis désolé, je ne peux pas vérifier votre identité. Cette communication va prendre fin. Au revoir."
+                            )
+                        finally:
+                            self._stt.resume()
+                        Thread(target=self.shutdown, daemon=True).start()
+                        return
+
+                    if self._verification_attempts <= 1:
+                        retry_message = "Je suis désolé, cette date ne correspond pas à nos enregistrements. Pouvez-vous réessayer ?"
+                    else:
+                        retry_message = "Ce n'est toujours pas correct. Il vous reste une dernière tentative."
+
+                    self._stt.pause()
+                    try:
+                        self.speak(retry_message)
+                    finally:
+                        self._stt.resume()
+
+                    self._awaiting_dob = True
+                    return
+
+                self._stt.pause()
+                try:
+                    self.speak(
+                        "Pour vérifier votre identité, pouvez-vous me donner votre date de naissance ?"
+                    )
+                finally:
+                    self._stt.resume()
+                self._awaiting_dob = True
+                return
 
             t0 = _time.monotonic()
             first_audio_time = None

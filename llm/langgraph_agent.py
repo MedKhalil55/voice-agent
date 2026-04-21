@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from importlib import import_module
@@ -35,6 +36,8 @@ class AgentState(TypedDict):
     agent_iterations: int
     tool_call_count: int
     customer_id: int | None
+    verified: bool
+    verification_attempts: int
 
 
 _CHROMA_COLLECTION = None
@@ -469,6 +472,257 @@ def _parse_agent_json_output(output: str) -> dict:
         return {
             "action": "respond",
         }
+
+
+def _normalize_french_text(value: str) -> str:
+    import unicodedata
+
+    normalized = unicodedata.normalize("NFKD", (value or "").lower())
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = normalized.replace("'", " ")
+    normalized = re.sub(r"[^a-z0-9\s\-]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _parse_french_number_words(text: str) -> int | None:
+    units = {
+        "zero": 0,
+        "un": 1,
+        "une": 1,
+        "deux": 2,
+        "trois": 3,
+        "quatre": 4,
+        "cinq": 5,
+        "six": 6,
+        "sept": 7,
+        "huit": 8,
+        "neuf": 9,
+        "dix": 10,
+        "onze": 11,
+        "douze": 12,
+        "treize": 13,
+        "quatorze": 14,
+        "quinze": 15,
+        "seize": 16,
+    }
+    tens = {
+        "vingt": 20,
+        "trente": 30,
+        "quarante": 40,
+        "cinquante": 50,
+        "soixante": 60,
+    }
+    fillers = {"et", "le", "la", "de", "du", "des"}
+
+    normalized = _normalize_french_text(text).replace("-", " ")
+    tokens = [tok for tok in normalized.split() if tok and tok not in fillers]
+    if not tokens:
+        return None
+
+    total = 0
+    current = 0
+    i = 0
+
+    while i < len(tokens):
+        tok = tokens[i]
+
+        if (
+            tok == "quatre"
+            and i + 1 < len(tokens)
+            and tokens[i + 1]
+            in {
+                "vingt",
+                "vingts",
+            }
+        ):
+            current += 80
+            i += 2
+            continue
+
+        if tok in units:
+            current += units[tok]
+            i += 1
+            continue
+
+        if tok in tens:
+            current += tens[tok]
+            i += 1
+            continue
+
+        if tok in {"cent", "cents"}:
+            if current == 0:
+                current = 1
+            current *= 100
+            i += 1
+            continue
+
+        if tok == "mille":
+            if current == 0:
+                current = 1
+            total += current * 1000
+            current = 0
+            i += 1
+            continue
+
+        return None
+
+    return total + current
+
+
+def _build_date(day: int, month: int, year: int) -> date | None:
+    try:
+        return date(int(year), int(month), int(day))
+    except Exception:
+        return None
+
+
+def extract_date_from_transcript(transcript: str) -> date | None:
+    """Extract a date of birth from free-form French transcript text."""
+
+    source = (transcript or "").strip()
+    if not source:
+        return None
+
+    # 08/11/1978 or 08-11-1978
+    match = re.search(r"(?<!\d)(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})(?!\d)", source)
+    if match:
+        parsed = _build_date(
+            day=int(match.group(1)),
+            month=int(match.group(2)),
+            year=int(match.group(3)),
+        )
+        if parsed is not None:
+            return parsed
+
+    # le 8 du 11 1978
+    match = re.search(
+        r"\ble\s+(\d{1,2})\s+(?:du|de)\s+(\d{1,2})\s+(\d{4})\b",
+        source,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        parsed = _build_date(
+            day=int(match.group(1)),
+            month=int(match.group(2)),
+            year=int(match.group(3)),
+        )
+        if parsed is not None:
+            return parsed
+
+    normalized = _normalize_french_text(source)
+
+    months = {
+        "janvier": 1,
+        "fevrier": 2,
+        "mars": 3,
+        "avril": 4,
+        "mai": 5,
+        "juin": 6,
+        "juillet": 7,
+        "aout": 8,
+        "septembre": 9,
+        "octobre": 10,
+        "novembre": 11,
+        "decembre": 12,
+    }
+    month_alt = "|".join(months.keys())
+
+    # 8 novembre 1978
+    match = re.search(rf"\b(\d{{1,2}})\s+({month_alt})\s+(\d{{4}})\b", normalized)
+    if match:
+        parsed = _build_date(
+            day=int(match.group(1)),
+            month=months[match.group(2)],
+            year=int(match.group(3)),
+        )
+        if parsed is not None:
+            return parsed
+
+    # huit novembre mille neuf cent soixante-dix-huit
+    match = re.search(
+        rf"\b(?:le\s+)?([a-z\-\s]{{2,20}})\s+({month_alt})\s+([a-z\-\s]{{3,60}})\b",
+        normalized,
+    )
+    if match:
+        day_value = _parse_french_number_words(match.group(1))
+        year_value = _parse_french_number_words(match.group(3))
+        if day_value is not None and year_value is not None:
+            parsed = _build_date(
+                day=day_value,
+                month=months[match.group(2)],
+                year=year_value,
+            )
+            if parsed is not None:
+                return parsed
+
+    # LLM fallback for hard spoken forms.
+    import json
+
+    prompt = (
+        "Extrait la date de naissance depuis cette phrase. "
+        'Reponds uniquement en JSON: {"day": int|null, "month": int|null, "year": int|null}.'
+    )
+
+    raw = (
+        call_llm_raw(
+            [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": source},
+            ],
+            num_predict=64,
+            temperature=0.0,
+        )
+        or ""
+    ).strip()
+
+    try:
+        match = re.search(r"\{.*?\}", raw, flags=re.DOTALL)
+        if not match:
+            return None
+        parsed = json.loads(match.group(0))
+        if not isinstance(parsed, dict):
+            return None
+        day_value = parsed.get("day")
+        month_value = parsed.get("month")
+        year_value = parsed.get("year")
+        if None in (day_value, month_value, year_value):
+            return None
+        return _build_date(int(day_value), int(month_value), int(year_value))
+    except Exception:
+        return None
+
+
+def verify_identity(transcript: str, customer_id: int, attempts: int) -> dict:
+    """Verify caller identity by matching spoken DOB against database DOB."""
+
+    current_attempts = max(int(attempts or 0), 0)
+    extracted_date = extract_date_from_transcript(transcript)
+
+    client_info = get_client_info(int(customer_id))
+    db_dob = client_info.get("date_de_naissance")
+
+    if isinstance(db_dob, date) and extracted_date is not None:
+        is_match = (
+            extracted_date.day == db_dob.day
+            and extracted_date.month == db_dob.month
+            and extracted_date.year == db_dob.year
+        )
+        if is_match:
+            return {
+                "verified": True,
+                "attempts": current_attempts,
+                "should_hangup": False,
+                "extracted_date": extracted_date,
+            }
+
+    updated_attempts = current_attempts + 1
+    return {
+        "verified": False,
+        "attempts": updated_attempts,
+        "should_hangup": updated_attempts >= 3,
+        "extracted_date": extracted_date,
+    }
 
 
 def _classify_intent(transcript: str, tool_results: list) -> dict:
@@ -1083,6 +1337,8 @@ def run_voice_agent_turn(transcript: str) -> AgentState:
         "agent_iterations": 0,
         "tool_call_count": 0,
         "customer_id": 1002,
+        "verified": False,
+        "verification_attempts": 0,
     }
     return _app.invoke(initial_state, config={"recursion_limit": 10})
 
@@ -1100,6 +1356,8 @@ def run_voice_agent_prepare(transcript: str, customer_id: int = 1002) -> dict:
         "agent_iterations": 0,
         "tool_call_count": 0,
         "customer_id": customer_id,
+        "verified": False,
+        "verification_attempts": 0,
     }
     result = _app.invoke(initial_state, config={"recursion_limit": 10})
     return {

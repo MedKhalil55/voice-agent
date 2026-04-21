@@ -15,6 +15,7 @@ def get_client_info(customer_id: int) -> dict[str, Any]:
         c.telephone_1,
         c.email,
         c.status as customer_status,
+        c.date_de_naissance,
         col.unpaid_amount,
         col.late_days,
         col.number_of_unpaid_installment,
