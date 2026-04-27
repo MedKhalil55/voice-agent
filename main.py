@@ -831,27 +831,67 @@ class VoiceAgent:
         intent_prompt = (
             "Détecte l'intention du client dans sa réponse à une proposition de plan de paiement. "
             "Choisis exactement une valeur parmi: accept, counter, refuse, question, other. "
-            "accept: oui, d'accord, ok, je confirme, c'est bon, parfait, accepte. "
+            "accept: oui, d'accord, ok, je confirme, c'est bon, parfait, j'accepte. "
+            "  N'EST PAS accept: toute phrase qui mentionne un nombre de fois ou un montant différent. "
             "counter: le client propose un autre montant ou un autre nombre de mensualités. "
+            "EXEMPLES counter: 'je veux payer en 6 fois', 'je préfère 2 mensualités', "
+            "'je peux payer 200 DT par mois', 'en 4 fois', 'payer en deux fois'. "
+            "'en une fois', 'tout en une seule fois', 'payer d un coup'. "
             "refuse: non, impossible, je ne peux pas, je refuse. "
-            "question: le client pose une question sur le plan. "
+            "question: le client pose une question générale sur la banque ou la loi. "
+            "N'est PAS une question: proposer un autre nombre de mensualités. "
             'Réponds uniquement en JSON: {"intent": "accept"|"counter"|"refuse"|"question"|"other"}.'
         )
 
-        intent_raw = call_llm_raw(
-            [
-                {"role": "system", "content": intent_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            num_predict=64,
-            temperature=0.0,
+        # Deterministic pre-check before LLM: force counter intent for
+        # "payer en X fois", "une seule fois", "paiement unique", etc.
+        import unicodedata as _ud
+
+        def _norm(text: str) -> str:
+            normalized = _ud.normalize("NFKD", (text or "").lower())
+            normalized = "".join(ch for ch in normalized if not _ud.combining(ch))
+            normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
+            normalized = re.sub(r"\s+", " ", normalized).strip()
+            return normalized
+
+        normalized_user_text = _norm(user_text)
+        counter_patterns = [
+            r"\ben\s+(une?|1|deux|2|trois|3|quatre|4|cinq|5|six|6)\s+(seule?\s+)?fois\b",
+            r"\bpayer\s+en\s+(une?|1|deux|2|trois|3|quatre|4|cinq|5|six|6)\b",
+            r"\b(une?|1)\s+seule?\s+fois\b",
+            r"\btout\s+(d\s*un|en\s+un)\s+coup\b",
+            r"\bpayer\s+tout\s+(d\s*un|en\s+un)\b",
+            r"\bpaiement\s+unique\b",
+            r"\ben\s+(\d+)\s+fois\b",
+            r"\b(\d+)\s+mensualit",
+        ]
+        forced_counter = any(
+            re.search(pattern, normalized_user_text) for pattern in counter_patterns
         )
-        intent = str(_extract_json(intent_raw).get("intent") or "other").lower().strip()
+
+        if forced_counter:
+            intent = "counter"
+        else:
+            intent_raw = call_llm_raw(
+                [
+                    {"role": "system", "content": intent_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                num_predict=64,
+                temperature=0.0,
+            )
+            intent = (
+                str(_extract_json(intent_raw).get("intent") or "other").lower().strip()
+            )
 
         if intent == "accept":
-            self._proposed_installments = max_inst
-            self._proposed_amount = suggested
-            self._proposed_date = first_date
+            # Keep previously negotiated counter values when present.
+            if self._proposed_installments == 0:
+                self._proposed_installments = max_inst
+            if self._proposed_amount == 0.0:
+                self._proposed_amount = suggested
+            if not self._proposed_date:
+                self._proposed_date = first_date
             self._negotiation_step = "save_promise"
             self._save_payment_promise(
                 transcript=user_text,
@@ -861,6 +901,51 @@ class VoiceAgent:
             return
 
         if intent == "counter":
+            # Deterministic pre-extract before LLM for obvious installment syntax.
+            # This avoids null/incorrect LLM extraction falling back to max_inst.
+            _INST_MAP = {
+                "une": 1,
+                "un": 1,
+                "1": 1,
+                "deux": 2,
+                "2": 2,
+                "trois": 3,
+                "3": 3,
+                "quatre": 4,
+                "4": 4,
+                "cinq": 5,
+                "5": 5,
+                "six": 6,
+                "6": 6,
+            }
+
+            forced_installments: int | None = None
+
+            # "en une seule fois" / "une fois" / "d'un coup" -> 1
+            if re.search(
+                r"\b(une?\s+seule?\s+fois|d.un\s+coup|paiement\s+unique|tout\s+en\s+un)\b",
+                normalized_user_text,
+            ):
+                forced_installments = 1
+            else:
+                # "en X fois" / "en X mensualités"
+                match_installment = re.search(
+                    r"\ben\s+(une?|1|deux|2|trois|3|quatre|4|cinq|5|six|6)\b",
+                    normalized_user_text,
+                )
+                if match_installment:
+                    forced_installments = _INST_MAP.get(
+                        match_installment.group(1).strip()
+                    )
+
+                # "X mensualités"
+                if forced_installments is None:
+                    match_installment = re.search(
+                        r"\b(\d+)\s+mensualit", normalized_user_text
+                    )
+                    if match_installment:
+                        forced_installments = int(match_installment.group(1))
+
             counter_prompt = (
                 "Extrait le nombre de mensualités ou le montant proposé par le client. "
                 'Réponds uniquement en JSON: {"installments": int|null, "amount": float|null}.'
@@ -878,6 +963,10 @@ class VoiceAgent:
             inst_value = counter_data.get("installments")
             amount_value = counter_data.get("amount")
 
+            # Regex extraction has priority over LLM output when present.
+            if forced_installments is not None:
+                inst_value = forced_installments
+
             try:
                 inst_value = int(inst_value) if inst_value is not None else max_inst
             except Exception:
@@ -890,7 +979,7 @@ class VoiceAgent:
                     else round(unpaid / max(inst_value, 1), 2)
                 )
             except Exception:
-                amount_value = suggested
+                amount_value = round(unpaid / max(inst_value, 1), 2)
 
             is_valid_installments = 1 <= inst_value <= max_inst
             is_valid_amount = float(amount_value) >= min_amount
@@ -997,44 +1086,35 @@ class VoiceAgent:
 
         if intent == "question":
             state = run_voice_agent_prepare(user_text, customer_id=self._customer_id)
-            route = state.get("route", "general")
             rag = (state.get("rag_context") or "").strip()
             tool_res = state.get("tool_results") or []
 
+            # Always anchor the answer to the currently proposed negotiation plan.
+            system_msg = (
+                "Tu es un conseiller bancaire tunisien au téléphone. "
+                "Réponds uniquement à la question posée de manière claire et courte. "
+                f"Le plan proposé actuellement est: {max_inst} mensualités de {suggested} DT, "
+                f"première échéance le {first_date}. "
+                f"Le client peut choisir entre 1 et {max_inst} mensualités maximum. "
+                "Si le client demande s'il peut payer en X fois et que X <= max autorisé, "
+                "réponds OUI directement et confirme que c'est possible. "
+                "Ne mentionne pas les conditions bancaires générales ni les articles juridiques. "
+                "Réponds exclusivement en français. Maximum 2 phrases."
+            )
+
             if tool_res and any(item.get("ok") for item in tool_res):
                 tool_client = tool_res[0]
-                system_msg = (
-                    "Tu es un conseiller bancaire tunisien au téléphone. "
-                    "Réponds uniquement à la question posée de manière claire et courte. "
-                    f"Le plan proposé est: {max_inst} mensualités de {suggested} DT, "
-                    f"première échéance le {first_date}. "
-                    "Si le client demande s'il peut payer en X fois et que X <= max_installments, "
-                    "dis oui et confirme le plan. "
-                    "Réponds exclusivement en français. Maximum 2 phrases."
-                )
                 answer_user_msg = (
-                    f"Question du client: {user_text}\n\n"
-                    f"Données client:\n"
-                    f"- Nom: {tool_client.get('customer_name', '')}\n"
-                    f"- Montant impayé: {tool_client.get('unpaid_amount', 0)} DT\n"
-                    f"- Jours de retard: {tool_client.get('late_days', 0)}\n"
-                    f"- Mensualités impayées: {tool_client.get('number_of_unpaid_installment', 0)}"
+                    f"Question: {user_text}\n"
+                    f"Données: montant impayé={tool_client.get('unpaid_amount', 0)} DT, "
+                    f"retard={tool_client.get('late_days', 0)} jours"
                 )
-            elif route == "rag" and rag:
-                system_msg = (
-                    "Tu es un conseiller bancaire tunisien. "
-                    "Avec le contexte juridique fourni, réponds simplement en français. "
-                    "Maximum 2 phrases."
-                )
+            elif rag:
                 answer_user_msg = (
-                    f"Contexte: {rag[:500]}\n\nQuestion du client: {user_text}"
+                    f"Question: {user_text}\n"
+                    "(contexte juridique disponible mais non prioritaire)"
                 )
             else:
-                system_msg = (
-                    "Tu es un conseiller bancaire tunisien au téléphone. "
-                    "Réponds de façon directe, naturelle et concise. "
-                    "Réponds exclusivement en français. Maximum 2 phrases."
-                )
                 answer_user_msg = user_text
 
             self._stt.pause()
@@ -1180,7 +1260,9 @@ class VoiceAgent:
 
     def speak(self, text: str) -> None:
         """TTS boundary: streaming playback with no intermediate WAV files."""
-
+        raw_text = (text or "").strip()
+        if raw_text:
+            _log(f"Assistant: {raw_text!r}")
         speak_streaming(clean_for_tts(text))
 
     def shutdown(self) -> None:
