@@ -104,6 +104,41 @@ def normalize_tunisian_phones_in_text(text: str) -> str:
     return pattern.sub(_repl, text)
 
 
+def normalize_tnd_amounts_in_text(text: str) -> str:
+    """Normalize Tunisian currency amounts for natural French TTS.
+
+    Example:
+    "444.44 DT" -> "444 dinars virgule 44"
+    "1 DT" -> "1 dinar"
+    "148 DT" -> "148 dinars"
+    """
+
+    pattern = re.compile(
+        r"(?<!\d)(\d+(?:[\.,]\d{1,2})?)\s*(?:dt|dinar(?:s)?(?:\s+tunisien(?:s)?)?)\b",
+        flags=re.IGNORECASE,
+    )
+
+    def _repl(match: re.Match[str]) -> str:
+        raw_amount = (match.group(1) or "").replace(",", ".")
+        try:
+            value = round(float(raw_amount), 2)
+        except ValueError:
+            return match.group(0)
+
+        whole = int(value)
+        cents = int(round((value - whole) * 100))
+        if cents == 100:
+            whole += 1
+            cents = 0
+
+        unit = "dinar" if whole == 1 else "dinars"
+        if cents > 0:
+            return f"{whole} {unit} virgule {cents:02d}"
+        return f"{whole} {unit}"
+
+    return pattern.sub(_repl, text)
+
+
 def clean_for_tts(text: str) -> str:
     """Post-process text to sound natural when spoken.
 
@@ -119,6 +154,8 @@ def clean_for_tts(text: str) -> str:
 
     # Normalize Tunisian phone numbers so TTS reads them as grouped numbers.
     value = normalize_tunisian_phones_in_text(value)
+    # Normalize currency so TTS says "dinar(s) virgule xx" instead of "DT".
+    value = normalize_tnd_amounts_in_text(value)
 
     # Normalize line endings first.
     value = value.replace("\r\n", "\n").replace("\r", "\n")
@@ -662,20 +699,16 @@ class VoiceAgent:
 
             self._stt.pause()
             try:
-                for sentence in stream_raw_sentences(
-                    user_msg, system_content=system_msg
+                for sentence in self._stream_sentences_with_decimal_fix(
+                    user_msg, system_msg
                 ):
-                    sentence = (sentence or "").strip()
-                    if not sentence:
-                        continue
-
                     full_response_parts.append(sentence)
 
                     if first_audio_time is None:
                         first_audio_time = _time.monotonic() - t0
                         _log(f"LLM first-sentence latency: {first_audio_time:.2f} sec")
 
-                    self.speak(sentence)
+                    self.speak(sentence, log_output=False)
             finally:
                 self._stt.resume()
 
@@ -783,14 +816,16 @@ class VoiceAgent:
         )
 
         generated_sentences = []
-        for sentence in stream_raw_sentences(user_msg, system_content=system_msg):
-            sentence = (sentence or "").strip()
-            if sentence:
-                generated_sentences.append(sentence)
-                self.speak(sentence)
+        for sentence in self._stream_sentences_with_decimal_fix(user_msg, system_msg):
+            generated_sentences.append(sentence)
+            self.speak(sentence, log_output=False)
+
+        generated_text = " ".join(generated_sentences).strip()
+        if generated_text:
+            _log(f"Assistant: {generated_text!r}")
 
         self._negotiation_step = "await_confirmation"
-        return " ".join(generated_sentences).strip()
+        return generated_text
 
     def _handle_negotiation_turn(self, user_text: str, turn_number: int) -> None:
         from llm.agent import call_llm_raw
@@ -902,49 +937,87 @@ class VoiceAgent:
 
         if intent == "counter":
             # Deterministic pre-extract before LLM for obvious installment syntax.
-            # This avoids null/incorrect LLM extraction falling back to max_inst.
+            # Clause-based extraction: ignore negated values like
+            # "je peux pas payer en 3 ..., est-ce que je peux payer en 6 ?".
             _INST_MAP = {
                 "une": 1,
                 "un": 1,
-                "1": 1,
                 "deux": 2,
-                "2": 2,
                 "trois": 3,
-                "3": 3,
                 "quatre": 4,
-                "4": 4,
                 "cinq": 5,
-                "5": 5,
                 "six": 6,
-                "6": 6,
             }
 
-            forced_installments: int | None = None
+            def _to_installments(token: str) -> int | None:
+                value = (token or "").strip()
+                if not value:
+                    return None
+                if value.isdigit():
+                    try:
+                        return int(value)
+                    except Exception:
+                        return None
+                return _INST_MAP.get(value)
 
-            # "en une seule fois" / "une fois" / "d'un coup" -> 1
-            if re.search(
-                r"\b(une?\s+seule?\s+fois|d.un\s+coup|paiement\s+unique|tout\s+en\s+un)\b",
-                normalized_user_text,
-            ):
-                forced_installments = 1
-            else:
-                # "en X fois" / "en X mensualités"
-                match_installment = re.search(
-                    r"\ben\s+(une?|1|deux|2|trois|3|quatre|4|cinq|5|six|6)\b",
-                    normalized_user_text,
+            def _norm_keep_clause_separators(text: str) -> str:
+                normalized = _ud.normalize("NFKD", (text or "").lower())
+                normalized = "".join(ch for ch in normalized if not _ud.combining(ch))
+                # Keep comma/semicolon so we can split clauses on them.
+                normalized = re.sub(r"[^a-z0-9\s,;]", " ", normalized)
+                normalized = re.sub(r"\s+", " ", normalized).strip()
+                return normalized
+
+            normalized_user_text_for_clauses = _norm_keep_clause_separators(user_text)
+            clauses = [
+                c.strip()
+                for c in re.split(
+                    r"\s*(?:[,;]|\bmais\b|\bou\b|\bdonc\b)\s*",
+                    normalized_user_text_for_clauses,
                 )
-                if match_installment:
-                    forced_installments = _INST_MAP.get(
-                        match_installment.group(1).strip()
-                    )
+                if c.strip()
+            ]
 
-                # "X mensualités"
-                if forced_installments is None:
-                    match_installment = re.search(
-                        r"\b(\d+)\s+mensualit", normalized_user_text
-                    )
-                    if match_installment:
-                        forced_installments = int(match_installment.group(1))
+            negation_re = re.compile(
+                r"(?:\bpas\b|\bne\s+peux\s+pas\b|\bne\s+peut\s+pas\b|\bjamais\b|\bimpossible\b|\bincapable\b)"
+            )
+            valid_installments: list[int] = []
+
+            # 1) Handle single-payment phrasing -> 1 (unless negated).
+            unique_payment_re = re.compile(
+                r"\b(une\s+seule\s+fois|d\s*un\s+coup|paiement\s+unique|tout\s+en\s+un)\b"
+            )
+            # 2) Handle "en X (fois|mensualites)"; also accepts bare "en X".
+            en_x_re = re.compile(
+                r"\ben\s+(?P<num>\d+|une|un|deux|trois|quatre|cinq|six)\b(?:\s+(?:fois|mensualit(?:e|es)))?"
+            )
+            # 3) Handle "X mensualites" without "en" (legacy behavior).
+            x_mens_re = re.compile(r"\b(?P<num>\d+)\s+mensualit(?:e|es)\b")
+
+            for clause in clauses:
+                for match in unique_payment_re.finditer(clause):
+                    if negation_re.search(clause[: match.start()]):
+                        continue
+                    valid_installments.append(1)
+
+                for match in en_x_re.finditer(clause):
+                    if negation_re.search(clause[: match.start()]):
+                        continue
+                    value = _to_installments(match.group("num"))
+                    if value is not None:
+                        valid_installments.append(value)
+
+                for match in x_mens_re.finditer(clause):
+                    if negation_re.search(clause[: match.start()]):
+                        continue
+                    try:
+                        valid_installments.append(int(match.group("num")))
+                    except Exception:
+                        continue
+
+            forced_installments: int | None = (
+                valid_installments[-1] if valid_installments else None
+            )
 
             counter_prompt = (
                 "Extrait le nombre de mensualités ou le montant proposé par le client. "
@@ -1120,18 +1193,19 @@ class VoiceAgent:
             self._stt.pause()
             question_answers: list[str] = []
             try:
-                for sentence in stream_raw_sentences(
-                    answer_user_msg, system_content=system_msg
+                for sentence in self._stream_sentences_with_decimal_fix(
+                    answer_user_msg, system_msg
                 ):
-                    sentence = (sentence or "").strip()
-                    if sentence:
-                        question_answers.append(sentence)
-                        self.speak(sentence)
+                    question_answers.append(sentence)
+                    self.speak(sentence, log_output=False)
                 followup_msg = "Revenons à notre proposition, acceptez-vous ce plan?"
                 question_answers.append(followup_msg)
                 self.speak(followup_msg)
             finally:
                 self._stt.resume()
+
+            if question_answers:
+                _log(f"Assistant: {' '.join(question_answers).strip()!r}")
 
             self._log_call_event(
                 transcript=user_text,
@@ -1258,10 +1332,43 @@ class VoiceAgent:
         # Keep this method for future integrations.
         return ""
 
-    def speak(self, text: str) -> None:
+    def _stream_sentences_with_decimal_fix(self, user_msg: str, system_msg: str):
+        """Yield streamed sentences while stitching decimal fragments.
+
+        Some streamers may split "444.44" into "444." then "44 ...".
+        This keeps natural TTS by merging those two parts before speaking.
+        """
+
+        pending: str | None = None
+
+        for raw_sentence in stream_raw_sentences(user_msg, system_content=system_msg):
+            sentence = (raw_sentence or "").strip()
+            if not sentence:
+                continue
+
+            if pending:
+                if re.search(r"\b\d+\.$", pending) and re.match(
+                    r"^\d{1,2}\b", sentence
+                ):
+                    sentence = f"{pending}{sentence}"
+                    pending = None
+                else:
+                    yield pending
+                    pending = None
+
+            if re.search(r"\b\d+\.$", sentence):
+                pending = sentence
+                continue
+
+            yield sentence
+
+        if pending:
+            yield pending
+
+    def speak(self, text: str, log_output: bool = True) -> None:
         """TTS boundary: streaming playback with no intermediate WAV files."""
         raw_text = (text or "").strip()
-        if raw_text:
+        if raw_text and log_output:
             _log(f"Assistant: {raw_text!r}")
         speak_streaming(clean_for_tts(text))
 
