@@ -113,13 +113,16 @@ def normalize_tnd_amounts_in_text(text: str) -> str:
     "148 DT" -> "148 dinars"
     """
 
+    # Accept up to 4 decimals and optional whitespace after the separator.
+    # Why: sentence splitters sometimes emit "1562." then "49DT" or even
+    # "1562. 49 DT"; we still want to normalize it into a single spoken amount.
     pattern = re.compile(
-        r"(?<!\d)(\d+(?:[\.,]\d{1,2})?)\s*(?:dt|dinar(?:s)?(?:\s+tunisien(?:s)?)?)\b",
+        r"(?<!\d)(\d+(?:[\.,]\s*\d{1,4})?)\s*(?:dt|dinar(?:s)?(?:\s+tunisien(?:s)?)?)\b",
         flags=re.IGNORECASE,
     )
 
     def _repl(match: re.Match[str]) -> str:
-        raw_amount = (match.group(1) or "").replace(",", ".")
+        raw_amount = re.sub(r"\s+", "", (match.group(1) or "")).replace(",", ".")
         try:
             value = round(float(raw_amount), 2)
         except ValueError:
@@ -253,6 +256,7 @@ class VoiceAgent:
         self._proposed_amount: float = 0.0
         self._proposed_date: str = ""
         self._negotiation_refusals: int = 0
+        self._client_reason: str = "unknown"
 
         self._shutdown_event = Event()
         self._processing_lock = Lock()
@@ -746,86 +750,127 @@ class VoiceAgent:
                 pass
 
     def _start_negotiation_turn(self) -> None:
-        profile = self._negotiation_profile
-        client = self._client_info
-
-        if not client:
-            try:
-                from db.tools import get_client_info
-
-                info = get_client_info(self._customer_id)
-                if info.get("found"):
-                    self._client_info = info
-                    client = info
-            except Exception as exc:
-                _log(f"[NEGO] Client fetch failed: {exc}")
-
-        if client and not profile:
-            profile = classify_client_profile(client)
-            self._negotiation_profile = profile
-
-        if not profile or not client:
-            fallback_msg = "Je vais maintenant vous présenter votre situation."
-            self.speak(fallback_msg)
-            self._negotiation_step = "await_confirmation"
-            return fallback_msg
-
-        unpaid = client.get("unpaid_amount", 0)
-        late = client.get("late_days", 0)
-        missed = client.get("number_of_unpaid_installment", 0)
-        profile_type = profile["profile"]
-        max_inst = profile["max_installments"]
-        suggested = profile["suggested_amount"]
-        first_date = profile["first_payment_date"]
-
-        if profile_type == "FIDELE":
-            system_msg = (
-                "Tu es un conseiller bancaire bienveillant qui appelle un bon client. "
-                "Ce client a un petit retard de paiement. Sois compréhensif et chaleureux. "
-                "Présente sa situation avec empathie. Propose un échéancier souple. "
-                f"Maximum {max_inst} mensualités. Objectif: obtenir un engagement amiable. "
-                "Réponds exclusivement en français. Maximum 3 phrases."
-            )
-        elif profile_type == "DIFFICILE":
-            system_msg = (
-                "Tu es un agent de recouvrement bancaire professionnel. "
-                "Ce client a plusieurs mensualités impayées. Sois ferme mais respectueux. "
-                "Présente les faits clairement. Insiste sur la nécessité de régulariser rapidement. "
-                f"Propose un plan sur maximum {max_inst} mensualités. "
-                "Réponds exclusivement en français. Maximum 3 phrases."
-            )
-        else:
-            system_msg = (
-                "Tu es un agent de recouvrement bancaire senior. "
-                "Ce client est en situation critique avec un retard grave. "
-                "Sois strict et professionnel. Mentionne les conséquences légales possibles "
-                "(inscription au fichier des mauvais payeurs, poursuites judiciaires). "
-                f"Propose un règlement immédiat ou un plan sur {max_inst} mois maximum. "
-                "Réponds exclusivement en français. Maximum 3 phrases."
-            )
-
-        user_msg = (
-            f"Situation du client {client.get('customer_name', '')}:\n"
-            f"- Montant impayé total: {unpaid} DT\n"
-            f"- Jours de retard: {late} jours\n"
-            f"- Mensualités manquantes: {missed}\n"
-            f"- Mensualité normale: {client.get('normal_payment', 0)} DT\n\n"
-            f"Présente-lui sa situation et propose un plan de {max_inst} mensualités "
-            f"de {suggested} DT chacune, première échéance le {first_date}.\n"
-            f"Demande-lui s'il accepte ce plan ou s'il préfère autre chose."
+        # Step 1: ask the reason before proposing the plan.
+        ask_reason_msg = (
+            "Avant tout, puis-je vous demander la raison de ce retard de paiement ?"
         )
+        already_paused = bool(
+            getattr(
+                getattr(self._stt, "_paused_event", None), "is_set", lambda: False
+            )()
+        )
+        if not already_paused:
+            self._stt.pause()
+        try:
+            self.speak(ask_reason_msg)
+        finally:
+            if not already_paused:
+                self._stt.resume()
+        self._negotiation_step = "await_reason"
+        return ask_reason_msg
 
-        generated_sentences = []
-        for sentence in self._stream_sentences_with_decimal_fix(user_msg, system_msg):
-            generated_sentences.append(sentence)
-            self.speak(sentence, log_output=False)
+    def _start_negotiation_turn_with_plan(self) -> None:
+        """Start the negotiation by presenting the debt and proposing a plan.
 
-        generated_text = " ".join(generated_sentences).strip()
-        if generated_text:
-            _log(f"Assistant: {generated_text!r}")
+        This is the previous body of `_start_negotiation_turn()`.
 
-        self._negotiation_step = "await_confirmation"
-        return generated_text
+        This method pauses STT while speaking, but only if it is not already
+        paused (to avoid nested pause/resume bugs).
+        """
+
+        already_paused = bool(
+            getattr(
+                getattr(self._stt, "_paused_event", None), "is_set", lambda: False
+            )()
+        )
+        if not already_paused:
+            self._stt.pause()
+        try:
+            profile = self._negotiation_profile
+            client = self._client_info
+
+            if not client:
+                try:
+                    from db.tools import get_client_info
+
+                    info = get_client_info(self._customer_id)
+                    if info.get("found"):
+                        self._client_info = info
+                        client = info
+                except Exception as exc:
+                    _log(f"[NEGO] Client fetch failed: {exc}")
+
+            if client and not profile:
+                profile = classify_client_profile(client)
+                self._negotiation_profile = profile
+
+            if not profile or not client:
+                fallback_msg = "Je vais maintenant vous présenter votre situation."
+                self.speak(fallback_msg)
+                self._negotiation_step = "await_confirmation"
+                return fallback_msg
+
+            unpaid = client.get("unpaid_amount", 0)
+            late = client.get("late_days", 0)
+            missed = client.get("number_of_unpaid_installment", 0)
+            profile_type = profile["profile"]
+            max_inst = profile["max_installments"]
+            suggested = profile["suggested_amount"]
+            first_date = profile["first_payment_date"]
+
+            if profile_type == "FIDELE":
+                system_msg = (
+                    "Tu es un conseiller bancaire bienveillant qui appelle un bon client. "
+                    "Ce client a un petit retard de paiement. Sois compréhensif et chaleureux. "
+                    "Présente sa situation avec empathie. Propose un échéancier souple. "
+                    f"Maximum {max_inst} mensualités. Objectif: obtenir un engagement amiable. "
+                    "Réponds exclusivement en français. Maximum 3 phrases."
+                )
+            elif profile_type == "DIFFICILE":
+                system_msg = (
+                    "Tu es un agent de recouvrement bancaire professionnel. "
+                    "Ce client a plusieurs mensualités impayées. Sois ferme mais respectueux. "
+                    "Présente les faits clairement. Insiste sur la nécessité de régulariser rapidement. "
+                    f"Propose un plan sur maximum {max_inst} mensualités. "
+                    "Réponds exclusivement en français. Maximum 3 phrases."
+                )
+            else:
+                system_msg = (
+                    "Tu es un agent de recouvrement bancaire senior. "
+                    "Ce client est en situation critique avec un retard grave. "
+                    "Sois strict et professionnel. Mentionne les conséquences légales possibles "
+                    "(inscription au fichier des mauvais payeurs, poursuites judiciaires). "
+                    f"Propose un règlement immédiat ou un plan sur {max_inst} mois maximum. "
+                    "Réponds exclusivement en français. Maximum 3 phrases."
+                )
+
+            user_msg = (
+                f"Situation du client {client.get('customer_name', '')}:\n"
+                f"- Montant impayé total: {unpaid} DT\n"
+                f"- Jours de retard: {late} jours\n"
+                f"- Mensualités manquantes: {missed}\n"
+                f"- Mensualité normale: {client.get('normal_payment', 0)} DT\n\n"
+                f"Présente-lui sa situation et propose un plan de {max_inst} mensualités "
+                f"de {suggested} DT chacune, première échéance le {first_date}.\n"
+                f"Demande-lui s'il accepte ce plan ou s'il préfère autre chose."
+            )
+
+            generated_sentences = []
+            for sentence in self._stream_sentences_with_decimal_fix(
+                user_msg, system_msg
+            ):
+                generated_sentences.append(sentence)
+                self.speak(sentence, log_output=False)
+
+            generated_text = " ".join(generated_sentences).strip()
+            if generated_text:
+                _log(f"Assistant: {generated_text!r}")
+
+            self._negotiation_step = "await_confirmation"
+            return generated_text
+        finally:
+            if not already_paused:
+                self._stt.resume()
 
     def _handle_negotiation_turn(self, user_text: str, turn_number: int) -> None:
         from llm.agent import call_llm_raw
@@ -833,6 +878,58 @@ class VoiceAgent:
             classify_client_profile,
             extract_payment_date_from_transcript,
         )
+
+        # STEP 2 — Handle reason capture before any other negotiation logic.
+        if self._negotiation_step == "await_reason":
+            reason_prompt = (
+                "Classe la raison donnée par le client pour le retard de paiement. "
+                "Choisis exactement une valeur parmi: financial_difficulty / forgot / dispute / other. "
+                "financial_difficulty: difficulté financière, chômage, baisse de revenus, maladie, imprévu. "
+                "forgot: oubli, négligence, pas vu, problème de date. "
+                "dispute: contestation, déjà payé, erreur, je ne dois pas, litige. "
+                "other: toute autre raison ou incertain. "
+                'Réponds uniquement en JSON: {"reason": "financial_difficulty"|"forgot"|"dispute"|"other"}.'
+            )
+            reason_raw = call_llm_raw(
+                [
+                    {"role": "system", "content": reason_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                num_predict=64,
+                temperature=0.0,
+            )
+            parsed_reason = str((reason_raw or "").strip())
+            reason_data: dict = {}
+            try:
+                match = re.search(r"\{.*?\}", parsed_reason, flags=re.DOTALL)
+                if match:
+                    loaded = json.loads(match.group(0)) if match else {}
+                    reason_data = loaded if isinstance(loaded, dict) else {}
+            except Exception:
+                reason_data = {}
+
+            reason_value = str((reason_data or {}).get("reason") or "other").strip()
+            if reason_value not in {
+                "financial_difficulty",
+                "forgot",
+                "dispute",
+                "other",
+            }:
+                reason_value = "other"
+            self._client_reason = reason_value
+
+            plan_text = self._start_negotiation_turn_with_plan()
+
+            self._log_call_event(
+                transcript=user_text,
+                intent="negotiation_reason",
+                outcome=f"reason_{self._client_reason}_plan_proposed",
+                agent_decision=(plan_text or ""),
+                turn_number=turn_number,
+            )
+
+            self._negotiation_step = "await_confirmation"
+            return
 
         if not self._client_info or not self._negotiation_profile:
             self._preload_client_info()
@@ -846,7 +943,6 @@ class VoiceAgent:
         max_inst = int(profile.get("max_installments") or 3)
         suggested = float(profile.get("suggested_amount") or 0.0)
         first_date = str(profile.get("first_payment_date") or "")
-        profile_type = str(profile.get("profile") or "DIFFICILE")
         unpaid = float(client.get("unpaid_amount") or 0.0)
         min_amount = round((unpaid / max_inst) * 0.8, 2) if max_inst > 0 else 0.0
 
@@ -860,7 +956,14 @@ class VoiceAgent:
             except Exception:
                 return {}
 
-        if self._negotiation_step != "await_confirmation":
+        if self._negotiation_step not in {
+            "await_confirmation",
+            "await_final_confirmation",
+            "await_reason",
+            "propose_alternative_date",
+            "propose_acompte",
+            "propose_rappel",
+        }:
             self._negotiation_step = "await_confirmation"
 
         intent_prompt = (
@@ -925,8 +1028,36 @@ class VoiceAgent:
                 self._proposed_installments = max_inst
             if self._proposed_amount == 0.0:
                 self._proposed_amount = suggested
-            if not self._proposed_date:
+
+            # Bugfix: always attempt to extract a (new) payment date from the transcript.
+            extracted_date = extract_payment_date_from_transcript(user_text)
+            if extracted_date:
+                self._proposed_date = extracted_date
+            elif not self._proposed_date:
                 self._proposed_date = first_date
+
+            # STEP 4 — Final recap confirmation before saving.
+            if self._negotiation_step != "await_final_confirmation":
+                recap_msg = (
+                    f"Pour confirmer : vous vous engagez à payer {self._proposed_installments} "
+                    f"mensualité(s) de {self._proposed_amount} DT, première échéance le "
+                    f"{self._proposed_date}. C'est bien votre accord ?"
+                )
+                self._stt.pause()
+                try:
+                    self.speak(recap_msg)
+                finally:
+                    self._stt.resume()
+                self._log_call_event(
+                    transcript=user_text,
+                    intent="negotiation_accept",
+                    outcome="prompt_final_confirmation",
+                    agent_decision=recap_msg,
+                    turn_number=turn_number,
+                )
+                self._negotiation_step = "await_final_confirmation"
+                return
+
             self._negotiation_step = "save_promise"
             self._save_payment_promise(
                 transcript=user_text,
@@ -1105,40 +1236,38 @@ class VoiceAgent:
             return
 
         if intent == "refuse":
+            # STEP 3 — Progressive refusal escalation with alternatives.
             self._negotiation_refusals += 1
 
-            if self._negotiation_refusals >= 2:
-                stop_msg = "Je prends note de votre refus. Cette communication va prendre fin. Au revoir."
-                self._stt.pause()
-                try:
-                    self.speak(stop_msg)
-                finally:
-                    self._stt.resume()
-                self._log_call_event(
-                    transcript=user_text,
-                    intent="negotiation_refuse",
-                    outcome="hangup",
-                    agent_decision=stop_msg,
-                    turn_number=turn_number,
-                )
-                Thread(target=self.shutdown, daemon=True).start()
-                return
-
-            if profile_type == "CONTENTIEUX":
+            if self._negotiation_refusals == 1:
                 message = (
-                    "Je vous informe que sans régularisation, des actions légales peuvent être engagées. "
-                    "Acceptez-vous notre proposition de plan ?"
+                    "Je comprends. Est-ce qu'une date d'échéance différente vous conviendrait mieux ? "
+                    "Par exemple, le 20 du mois ?"
                 )
-            elif profile_type == "DIFFICILE":
+                next_step = "propose_alternative_date"
+                outcome = "refuse_stage_1_alternative_date"
+            elif self._negotiation_refusals == 2:
                 message = (
-                    "Sans engagement, votre dossier risque de passer à une étape plus contraignante. "
-                    "Pouvez-vous confirmer ce plan ?"
+                    f"Pouvez-vous au moins verser un acompte de {min_amount} DT maintenant, "
+                    f"et régler le reste en {max(max_inst - 1, 1)} fois ?"
                 )
+                next_step = "propose_acompte"
+                outcome = "refuse_stage_2_acompte"
+            elif self._negotiation_refusals == 3:
+                message = (
+                    "Je comprends votre situation. Je peux vous rappeler dans 15 jours. "
+                    "Est-ce que ça vous convient ?"
+                )
+                next_step = "propose_rappel"
+                outcome = "refuse_stage_3_rappel"
             else:
+                # Final stage: hang up with legal warning.
                 message = (
-                    "Je comprends votre situation. Nous pouvons aussi organiser un rappel pour vous aider. "
-                    "Souhaitez-vous quand même accepter ce plan aujourd'hui ?"
+                    "Je prends note de votre refus. Sans régularisation, des actions légales peuvent être engagées. "
+                    "Au revoir."
                 )
+                next_step = "hangup"
+                outcome = "hangup"
 
             self._stt.pause()
             try:
@@ -1149,12 +1278,16 @@ class VoiceAgent:
             self._log_call_event(
                 transcript=user_text,
                 intent="negotiation_refuse",
-                outcome="retry",
+                outcome=outcome,
                 agent_decision=message,
                 turn_number=turn_number,
             )
 
-            self._negotiation_step = "await_confirmation"
+            self._negotiation_step = next_step
+            if next_step == "hangup":
+                Thread(target=self.shutdown, daemon=True).start()
+                return
+
             return
 
         if intent == "question":
@@ -1347,8 +1480,10 @@ class VoiceAgent:
                 continue
 
             if pending:
+                # Merge cents when sentence segmentation splits decimals.
+                # Allow cases like "49 DT" and "49DT" (no word boundary after digits).
                 if re.search(r"\b\d+\.$", pending) and re.match(
-                    r"^\d{1,2}\b", sentence
+                    r"^\d{1,4}(?=\D|$)", sentence
                 ):
                     sentence = f"{pending}{sentence}"
                     pending = None
