@@ -41,8 +41,8 @@ from tts import speak_streaming, warmup_tts
 
 
 OUTBOUND_GREETING = (
-    "Bonjour, je suis l’assistant bancaire automatique et je vous appelle au sujet de votre compte. "
-    "Comment puis-je vous aider aujourd’hui ?"
+    "Bonjour, je suis l'assistant de recouvrement de votre établissement bancaire. Je vous contacte aujourd'hui concernant des échéances impayées sur votre compte. Afin de traiter votre dossier, j'ai besoin de vérifier votre identité. "
+    "Pouvez-vous me communiquer votre date de naissance ?"
 )
 
 
@@ -257,6 +257,7 @@ class VoiceAgent:
         self._proposed_date: str = ""
         self._negotiation_refusals: int = 0
         self._client_reason: str = "unknown"
+        self._client_reason_raw: str = ""
 
         self._shutdown_event = Event()
         self._processing_lock = Lock()
@@ -364,9 +365,7 @@ class VoiceAgent:
 
         self._stt.pause()
         try:
-            self.speak(
-                "Pour vérifier votre identité, pouvez-vous me donner votre date de naissance ?"
-            )
+            self.speak("Pouvez-vous me communiquer votre date de naissance ?")
             self._awaiting_dob = True
         finally:
             self._stt.resume()
@@ -916,6 +915,7 @@ class VoiceAgent:
                 "other",
             }:
                 reason_value = "other"
+            self._client_reason_raw = user_text
             self._client_reason = reason_value
 
             plan_text = self._start_negotiation_turn_with_plan()
@@ -1003,12 +1003,50 @@ class VoiceAgent:
             r"\ben\s+(\d+)\s+fois\b",
             r"\b(\d+)\s+mensualit",
         ]
+
+        strong_accept_markers = [
+            "j accepte",
+            "je confirme",
+            "c est bon",
+            "d accord",
+            "parfait",
+        ]
+        strong_accept_like = any(
+            marker in normalized_user_text for marker in strong_accept_markers
+        )
+        if "accepte pas" in normalized_user_text:
+            strong_accept_like = False
+
+        extracted_date_precheck = extract_payment_date_from_transcript(user_text)
+        date_counter_patterns = [
+            r"\bdate\s+d\s*echeance\b",
+            r"\bl\s*echeance\s+(?:le\s+)?\d{1,2}\b",
+            r"\bje\s+veux\s+(?:que\s+)?la\s+date\b",
+            r"\bdate\b",
+            r"\becheance\b",
+        ]
+
         forced_counter = any(
             re.search(pattern, normalized_user_text) for pattern in counter_patterns
         )
+        forced_date_counter = (
+            bool(extracted_date_precheck)
+            and (not strong_accept_like)
+            and (
+                any(
+                    re.search(pattern, normalized_user_text)
+                    for pattern in date_counter_patterns
+                )
+                or re.search(r"\bc\s*est\s+possible\b", normalized_user_text)
+                or self._negotiation_step == "propose_alternative_date"
+            )
+        )
+        forced_counter = forced_counter or forced_date_counter
 
         if forced_counter:
             intent = "counter"
+        elif strong_accept_like:
+            intent = "accept"
         else:
             intent_raw = call_llm_raw(
                 [
@@ -1031,13 +1069,18 @@ class VoiceAgent:
 
             # Bugfix: always attempt to extract a (new) payment date from the transcript.
             extracted_date = extract_payment_date_from_transcript(user_text)
+            date_changed = bool(
+                extracted_date and extracted_date != self._proposed_date
+            )
             if extracted_date:
                 self._proposed_date = extracted_date
             elif not self._proposed_date:
                 self._proposed_date = first_date
 
             # STEP 4 — Final recap confirmation before saving.
-            if self._negotiation_step != "await_final_confirmation":
+            # If the client changes the date while "accepting" in final confirmation,
+            # force a new recap instead of saving immediately.
+            if self._negotiation_step != "await_final_confirmation" or date_changed:
                 recap_msg = (
                     f"Pour confirmer : vous vous engagez à payer {self._proposed_installments} "
                     f"mensualité(s) de {self._proposed_amount} DT, première échéance le "
@@ -1171,19 +1214,56 @@ class VoiceAgent:
             if forced_installments is not None:
                 inst_value = forced_installments
 
-            try:
-                inst_value = int(inst_value) if inst_value is not None else max_inst
-            except Exception:
-                inst_value = max_inst
+            # Sticky negotiation fields: keep previously negotiated values unless
+            # the user explicitly proposes a new one in THIS turn.
+            prev_installments = int(self._proposed_installments or 0)
+            prev_amount = float(self._proposed_amount or 0.0)
+            prev_date = str(self._proposed_date or "").strip()
 
+            inst_explicit = inst_value is not None
             try:
-                amount_value = (
-                    float(amount_value)
-                    if amount_value is not None
-                    else round(unpaid / max(inst_value, 1), 2)
+                inst_candidate = int(inst_value) if inst_value is not None else None
+            except Exception:
+                inst_candidate = None
+            if inst_candidate is None:
+                inst_candidate = (
+                    prev_installments if prev_installments > 0 else max_inst
+                )
+
+            amount_explicit = amount_value is not None
+            try:
+                amount_candidate = (
+                    float(amount_value) if amount_value is not None else None
                 )
             except Exception:
-                amount_value = round(unpaid / max(inst_value, 1), 2)
+                amount_candidate = None
+
+            if amount_candidate is None:
+                # If user explicitly changed installments but didn't specify an amount,
+                # recompute a sensible default for that installment count.
+                if inst_explicit and not amount_explicit:
+                    amount_candidate = round(unpaid / max(inst_candidate, 1), 2)
+                else:
+                    amount_candidate = (
+                        prev_amount
+                        if prev_amount > 0.0
+                        else round(unpaid / max(inst_candidate, 1), 2)
+                    )
+
+            extracted_date = extract_payment_date_from_transcript(user_text)
+
+            # Date-only counter: keep the current plan (installments/amount)
+            # and only update the payment date.
+            if extracted_date and not inst_explicit and not amount_explicit:
+                inst_candidate = (
+                    prev_installments if prev_installments > 0 else max_inst
+                )
+                amount_candidate = prev_amount if prev_amount > 0.0 else suggested
+
+            date_candidate = extracted_date or prev_date or first_date
+
+            inst_value = inst_candidate
+            amount_value = amount_candidate
 
             is_valid_installments = 1 <= inst_value <= max_inst
             is_valid_amount = float(amount_value) >= min_amount
@@ -1191,9 +1271,7 @@ class VoiceAgent:
             if is_valid_installments and is_valid_amount:
                 self._proposed_installments = inst_value
                 self._proposed_amount = round(float(amount_value), 2)
-                self._proposed_date = (
-                    extract_payment_date_from_transcript(user_text) or first_date
-                )
+                self._proposed_date = date_candidate
                 self._negotiation_step = "await_confirmation"
                 self._stt.pause()
                 try:
@@ -1247,6 +1325,12 @@ class VoiceAgent:
                 next_step = "propose_alternative_date"
                 outcome = "refuse_stage_1_alternative_date"
             elif self._negotiation_refusals == 2:
+                acompte_installments = 1
+                self._proposed_installments = acompte_installments
+                self._proposed_amount = float(min_amount)
+                if not self._proposed_date:
+                    self._proposed_date = first_date
+
                 message = (
                     f"Pouvez-vous au moins verser un acompte de {min_amount} DT maintenant, "
                     f"et régler le reste en {max(max_inst - 1, 1)} fois ?"
@@ -1383,6 +1467,8 @@ class VoiceAgent:
                 amount=self._proposed_amount,
                 installments=self._proposed_installments,
                 promised_date=self._proposed_date,
+                reason=self._client_reason,
+                reason_raw=self._client_reason_raw,
             )
             if result.get("success") or result.get("ok"):
                 self._negotiation_active = False

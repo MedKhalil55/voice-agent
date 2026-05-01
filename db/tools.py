@@ -62,11 +62,13 @@ def create_payment_promise(
     amount: float,
     installments: int,
     promised_date: str,
+    reason: str = "",          # ← AJOUTER
+    reason_raw: str = "",      # ← AJOUTER
 ) -> dict[str, Any]:
     query = """
     INSERT INTO acm_payment_promise
-        (customer_id, amount, installments, promised_date, status, created_by)
-    VALUES (%s, %s, %s, %s, 'PROMISED', 'VOICE_AGENT')
+        (customer_id, amount, installments, promised_date, status, created_by, reason, reason_raw)
+    VALUES (%s, %s, %s, %s, 'PROMISED', 'VOICE_AGENT', %s, %s)
     RETURNING id
     """
 
@@ -75,7 +77,7 @@ def create_payment_promise(
             try:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
                     cur.execute(
-                        query, (customer_id, amount, installments, promised_date)
+                        query, (customer_id, amount, installments, promised_date, reason, reason_raw)
                     )
                     row = cur.fetchone()
                 conn.commit()
