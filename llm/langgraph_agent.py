@@ -730,7 +730,7 @@ def classify_client_profile(client_info: dict) -> dict:
     unpaid_installments = int(client_info.get("number_of_unpaid_installment") or 0)
     workflow = str(client_info.get("statut_workflow") or "").strip().upper()
 
-    if late_days < 30 or (unpaid_installments <= 1 and workflow == "EN_ATTENTE"):
+    if late_days <= 30 or (unpaid_installments <= 1 and workflow == "EN_ATTENTE"):
         profile = "FIDELE"
         max_installments = 6
         tone = "soft"

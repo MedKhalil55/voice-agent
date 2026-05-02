@@ -392,6 +392,36 @@ class VoiceAgent:
         normalized = " ".join(cleaned.lower().split())
         if len(normalized) < 3 or all(c in ".,!?…- " for c in normalized):
             return
+
+        NOISE_TOKENS = {
+            "mouh",
+            "mh",
+            "hm",
+            "hmm",
+            "euh",
+            "ah",
+            "oh",
+            "hein",
+            "bah",
+            "ben",
+            "pff",
+            "voila",
+            "ouais ouais",
+            "mall",
+            "mal",
+            "mmm",
+            "allo",
+            "allô",
+            "mhm",
+            "ouais",
+            "heu",
+            "euh voila",
+            "nan",
+            "bof",
+        }
+        if normalized in NOISE_TOKENS:
+            _log(f"[STT] Filtered ASR noise: {normalized!r}")
+            return
         if not normalized:
             return
 
@@ -1061,6 +1091,30 @@ class VoiceAgent:
             )
 
         if intent == "accept":
+            # If we just proposed a callback, "accept" means the client accepts the
+            # callback scheduling, not the payment plan.
+            if self._negotiation_step == "propose_rappel":
+                rappel_msg = (
+                    "Très bien, je note un rappel dans 15 jours. "
+                    f"En attendant, gardez à l'esprit que votre dette de {unpaid} DT "
+                    "doit être régularisée. Bonne journée."
+                )
+                self._stt.pause()
+                try:
+                    self.speak(rappel_msg)
+                finally:
+                    self._stt.resume()
+                self._log_call_event(
+                    transcript=user_text,
+                    intent="negotiation_rappel_accepted",
+                    outcome="rappel_scheduled",
+                    agent_decision=rappel_msg,
+                    turn_number=turn_number,
+                )
+                self._negotiation_active = False
+                self._negotiation_step = "done"
+                return
+
             # Keep previously negotiated counter values when present.
             if self._proposed_installments == 0:
                 self._proposed_installments = max_inst
@@ -1338,6 +1392,13 @@ class VoiceAgent:
                 next_step = "propose_acompte"
                 outcome = "refuse_stage_2_acompte"
             elif self._negotiation_refusals == 3:
+                # Reset to the standard plan: accepting a callback should not
+                # inherit the acompte proposal values.
+                self._proposed_installments = max_inst
+                self._proposed_amount = suggested
+                if not self._proposed_date:
+                    self._proposed_date = first_date
+
                 message = (
                     "Je comprends votre situation. Je peux vous rappeler dans 15 jours. "
                     "Est-ce que ça vous convient ?"
@@ -1435,10 +1496,28 @@ class VoiceAgent:
             self._negotiation_step = "await_confirmation"
             return
 
-        fallback_other_msg = (
-            "Je n'ai pas bien compris. "
-            f"Acceptez-vous le plan de {max_inst} mensualités de {suggested} DT ?"
+        # Use negotiated values if available, otherwise fall back to profile defaults.
+        display_inst = (
+            self._proposed_installments if self._proposed_installments > 0 else max_inst
         )
+        display_amount = (
+            self._proposed_amount if self._proposed_amount > 0.0 else suggested
+        )
+
+        if self._negotiation_step == "await_final_confirmation":
+            fallback_other_msg = (
+                f"Désolé, je n'ai pas compris. Pour confirmer : "
+                f"{display_inst} mensualité(s) de {display_amount} DT, "
+                f"première échéance le {self._proposed_date}. "
+                "Oui ou non ?"
+            )
+        else:
+            fallback_other_msg = (
+                "Je n'ai pas bien compris. "
+                f"Confirmez-vous le plan de {display_inst} mensualité(s) "
+                f"de {display_amount} DT ?"
+            )
+
         self._stt.pause()
         try:
             self.speak(fallback_other_msg)
@@ -1451,7 +1530,9 @@ class VoiceAgent:
             agent_decision=fallback_other_msg,
             turn_number=turn_number,
         )
-        self._negotiation_step = "await_confirmation"
+        # Do NOT reset negotiation_step if we are awaiting final confirmation.
+        if self._negotiation_step != "await_final_confirmation":
+            self._negotiation_step = "await_confirmation"
 
     def _save_payment_promise(
         self,
