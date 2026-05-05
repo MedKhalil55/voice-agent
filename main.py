@@ -40,9 +40,7 @@ from stt.streaming_whisper import VadConfig
 from tts import speak_streaming, warmup_tts
 
 
-OUTBOUND_GREETING = (
-    "Bonjour, je suis l'assistant de recouvrement de votre établissement bancaire. Je vous contacte aujourd'hui concernant des échéances impayées sur votre compte. Afin de traiter votre dossier, j'ai besoin de vérifier votre identité. "
-)
+OUTBOUND_GREETING = "Bonjour, je suis l'assistant de recouvrement de votre établissement bancaire. Je vous contacte aujourd'hui concernant des échéances impayées sur votre compte. Afin de traiter votre dossier, j'ai besoin de vérifier votre identité. "
 
 
 def _log(message: str) -> None:
@@ -247,6 +245,8 @@ class VoiceAgent:
         self._verified: bool = False
         self._verification_attempts: int = 0
         self._awaiting_dob: bool = False
+        self._awaiting_name_confirmation: bool = False
+        self._name_confirmation_attempts: int = 0
         self._negotiation_active: bool = False
         self._negotiation_profile: dict | None = None
         self._client_info: dict | None = None
@@ -353,26 +353,50 @@ class VoiceAgent:
         # Start microphone streaming once.
         self._stt.start_stream()
 
+        # Récupérer le nom du client AVANT le greeting
+        client_name = ""
+        try:
+            from db.tools import get_client_info
+
+            info = get_client_info(self._customer_id)
+            if info.get("found"):
+                self._client_info = info
+                client_name = str(info.get("customer_name", "")).strip()
+        except Exception:
+            pass
+
+        # Greeting personnalisé avec le nom
+        civilite = "Monsieur"  # ou logique selon le nom
+
+        if client_name:
+            greeting = (
+                f"Bonjour, je suis l'assistant de recouvrement "
+                f"de votre établissement bancaire. "
+                f"Je vous contacte au sujet de votre compte. "
+                f"Ai-je bien {civilite} {client_name} en ligne ?"
+            )
+        else:
+            greeting = OUTBOUND_GREETING
+
         # Pause during greeting playback to avoid STT hearing the assistant.
         self._stt.pause()
         try:
-            self.speak(OUTBOUND_GREETING)
+            self.speak(greeting)
             self._session_summary["turns"].append(
                 {
                     "user_text": None,
-                    "assistant_text": OUTBOUND_GREETING,
+                    "assistant_text": greeting,
                     "event": "greeting",
                 }
             )
         finally:
             self._stt.resume()
 
-        self._stt.pause()
-        try:
-            self.speak("Pouvez-vous me communiquer votre date de naissance ?")
+        # Attendre confirmation identité
+        if client_name:
+            self._awaiting_name_confirmation = True
+        else:
             self._awaiting_dob = True
-        finally:
-            self._stt.resume()
 
         # Pre-load client profile in background for faster negotiation start.
         Thread(target=self._preload_client_info, daemon=True).start()
@@ -479,6 +503,11 @@ class VoiceAgent:
             current_turn = self._turn_number
 
             if not self._verified:
+                # Nouvelle étape : confirmation nom avant DOB
+                if self._awaiting_name_confirmation:
+                    self._handle_name_confirmation(user_text, current_turn)
+                    return
+
                 if self._awaiting_dob:
                     verification = verify_identity(
                         transcript=user_text,
@@ -1618,6 +1647,123 @@ class VoiceAgent:
         # Do NOT reset negotiation_step if we are awaiting final confirmation.
         if self._negotiation_step != "await_final_confirmation":
             self._negotiation_step = "await_confirmation"
+        return
+
+    def _handle_name_confirmation(self, user_text: str, turn_number: int) -> None:
+        from llm.agent import call_llm_raw
+
+        # LLM détecte si le client confirme son identité
+        confirm_prompt = (
+            "Le client répond à la question 'Ai-je bien X en ligne ?'. "
+            "Détecte sa réponse. "
+            "yes: oui, c'est moi, exact, bien sûr, affirmatif, oui c'est bien moi. "
+            "no: non, vous faites erreur, mauvais numéro, ce n'est pas moi. "
+            "other: réponse incompréhensible ou hors sujet. "
+            'Réponds uniquement en JSON: {"confirm": "yes"|"no"|"other"}'
+        )
+
+        raw = call_llm_raw(
+            [
+                {"role": "system", "content": confirm_prompt},
+                {"role": "user", "content": user_text},
+            ],
+            num_predict=32,
+            temperature=0.0,
+        )
+
+        import json as _json
+
+        confirm = "other"
+        try:
+            match = re.search(r"\{.*?\}", raw or "", flags=re.DOTALL)
+            if match:
+                parsed = _json.loads(match.group(0))
+                confirm = str(parsed.get("confirm", "other")).strip()
+        except Exception:
+            pass
+
+        client_name = str((self._client_info or {}).get("customer_name", "")).strip()
+
+        if confirm == "yes":
+            # Client confirmé → demander DOB
+            self._awaiting_name_confirmation = False
+            self._awaiting_dob = True
+            dob_msg = (
+                f"Merci {client_name}. "
+                "Pour vérifier votre identité, "
+                "pouvez-vous me communiquer "
+                "votre date de naissance ?"
+            )
+            self._stt.pause()
+            try:
+                self.speak(dob_msg)
+            finally:
+                self._stt.resume()
+            self._log_call_event(
+                transcript=user_text,
+                intent="name_confirmation",
+                outcome="confirmed",
+                agent_decision=dob_msg,
+                turn_number=turn_number,
+            )
+
+        elif confirm == "no":
+            # Mauvais numéro → raccroche poli
+            wrong_msg = (
+                "Je suis désolé pour le dérangement. "
+                "Il semble que nous ayons le mauvais numéro. "
+                "Bonne journée."
+            )
+            self._stt.pause()
+            try:
+                self.speak(wrong_msg)
+            finally:
+                self._stt.resume()
+            self._log_call_event(
+                transcript=user_text,
+                intent="name_confirmation",
+                outcome="wrong_number",
+                agent_decision=wrong_msg,
+                turn_number=turn_number,
+            )
+            Thread(target=self.shutdown, daemon=True).start()
+
+        else:
+            # Réponse incomprise → réessayer max 2 fois
+            self._name_confirmation_attempts += 1
+            if self._name_confirmation_attempts >= 2:
+                # Passer directement à DOB
+                self._awaiting_name_confirmation = False
+                self._awaiting_dob = True
+                fallback_msg = (
+                    "Pour vérifier votre identité, "
+                    "pouvez-vous me communiquer "
+                    "votre date de naissance ?"
+                )
+                self._stt.pause()
+                try:
+                    self.speak(fallback_msg)
+                finally:
+                    self._stt.resume()
+            else:
+                retry_msg = (
+                    f"Je suis désolé, je n'ai pas bien compris. "
+                    f"Ai-je bien {client_name} en ligne ?"
+                )
+                self._stt.pause()
+                try:
+                    self.speak(retry_msg)
+                finally:
+                    self._stt.resume()
+            self._log_call_event(
+                transcript=user_text,
+                intent="name_confirmation",
+                outcome="unclear",
+                agent_decision=retry_msg
+                if self._name_confirmation_attempts < 2
+                else fallback_msg,
+                turn_number=turn_number,
+            )
 
     def _save_payment_promise(
         self,
