@@ -981,7 +981,7 @@ class VoiceAgent:
         from llm.agent import call_llm_raw
         from llm.langgraph_agent import (
             classify_client_profile,
-            extract_payment_date_from_transcript,
+            run_negotiation_graph,
         )
 
         # Claim detection BEFORE any intent logic
@@ -1080,195 +1080,33 @@ class VoiceAgent:
         if self._client_info and not self._negotiation_profile:
             self._negotiation_profile = classify_client_profile(self._client_info)
 
-        profile = self._negotiation_profile or {}
-        client = self._client_info or {}
-
-        max_inst = int(profile.get("max_installments") or 3)
-        suggested = float(profile.get("suggested_amount") or 0.0)
-        first_date = str(profile.get("first_payment_date") or "")
-        unpaid = float(client.get("unpaid_amount") or 0.0)
-        min_amount = round((unpaid / max_inst) * 0.8, 2) if max_inst > 0 else 0.0
-
-        def _extract_json(raw: str) -> dict:
-            try:
-                match = re.search(r"\{.*?\}", raw or "", flags=re.DOTALL)
-                if not match:
-                    return {}
-                payload = json.loads(match.group(0))
-                return payload if isinstance(payload, dict) else {}
-            except Exception:
-                return {}
-
-        if self._negotiation_step not in {
-            "await_confirmation",
-            "await_final_confirmation",
-            "await_reason",
-            "propose_alternative_date",
-            "propose_acompte",
-            "propose_rappel",
-        }:
-            self._negotiation_step = "await_confirmation"
-
-        intent_prompt = (
-            "Détecte l'intention du client dans sa réponse à une proposition de plan de paiement. "
-            "Choisis exactement une valeur parmi: accept, counter, refuse, question, other. "
-            "accept: oui, d'accord, ok, je confirme, c'est bon, parfait, j'accepte. "
-            "  N'EST PAS accept: toute phrase qui mentionne un nombre de fois ou un montant différent. "
-            "counter: le client propose un autre montant ou un autre nombre de mensualités. "
-            "EXEMPLES counter: 'je veux payer en 6 fois', 'je préfère 2 mensualités', "
-            "'je peux payer 200 DT par mois', 'en 4 fois', 'payer en deux fois'. "
-            "'en une fois', 'tout en une seule fois', 'payer d un coup'. "
-            "refuse: non, impossible, je ne peux pas, je refuse. "
-            "question: le client pose une question générale sur la banque ou la loi. "
-            "N'est PAS une question: proposer un autre nombre de mensualités. "
-            'Réponds uniquement en JSON: {"intent": "accept"|"counter"|"refuse"|"question"|"other"}.'
+        result = run_negotiation_graph(
+            user_text=user_text,
+            negotiation_step=self._negotiation_step,
+            proposed_installments=self._proposed_installments,
+            proposed_amount=self._proposed_amount,
+            proposed_date=self._proposed_date,
+            negotiation_refusals=self._negotiation_refusals,
+            profile=self._negotiation_profile or {},
+            client_info=self._client_info or {},
+            client_reason=self._client_reason,
         )
 
-        # Deterministic pre-check before LLM: force counter intent for
-        # "payer en X fois", "une seule fois", "paiement unique", etc.
-        import unicodedata as _ud
-
-        def _norm(text: str) -> str:
-            normalized = _ud.normalize("NFKD", (text or "").lower())
-            normalized = "".join(ch for ch in normalized if not _ud.combining(ch))
-            normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
-            normalized = re.sub(r"\s+", " ", normalized).strip()
-            return normalized
-
-        normalized_user_text = _norm(user_text)
-        counter_patterns = [
-            r"\ben\s+(une?|1|deux|2|trois|3|quatre|4|cinq|5|six|6)\s+(seule?\s+)?fois\b",
-            r"\bpayer\s+en\s+(une?|1|deux|2|trois|3|quatre|4|cinq|5|six|6)\b",
-            r"\b(une?|1)\s+seule?\s+fois\b",
-            r"\btout\s+(d\s*un|en\s+un)\s+coup\b",
-            r"\bpayer\s+tout\s+(d\s*un|en\s+un)\b",
-            r"\bpaiement\s+unique\b",
-            r"\ben\s+(\d+)\s+fois\b",
-            r"\b(\d+)\s+mensualit",
-        ]
-
-        strong_accept_markers = [
-            "j accepte",
-            "je confirme",
-            "c est bon",
-            "d accord",
-            "parfait",
-        ]
-        strong_accept_like = any(
-            marker in normalized_user_text for marker in strong_accept_markers
+        self._negotiation_step = result.get("next_step", self._negotiation_step)
+        self._proposed_installments = result.get(
+            "new_installments", self._proposed_installments
         )
-        if "accepte pas" in normalized_user_text:
-            strong_accept_like = False
-
-        extracted_date_precheck = extract_payment_date_from_transcript(user_text)
-        date_counter_patterns = [
-            r"\bdate\s+d\s*echeance\b",
-            r"\bl\s*echeance\s+(?:le\s+)?\d{1,2}\b",
-            r"\bje\s+veux\s+(?:que\s+)?la\s+date\b",
-            r"\bdate\b",
-            r"\becheance\b",
-        ]
-
-        forced_counter = any(
-            re.search(pattern, normalized_user_text) for pattern in counter_patterns
+        self._proposed_amount = result.get("new_amount", self._proposed_amount)
+        self._proposed_date = result.get("new_date", self._proposed_date)
+        self._negotiation_refusals = result.get(
+            "new_refusals", self._negotiation_refusals
         )
-        forced_date_counter = (
-            bool(extracted_date_precheck)
-            and (not strong_accept_like)
-            and (
-                any(
-                    re.search(pattern, normalized_user_text)
-                    for pattern in date_counter_patterns
-                )
-                or re.search(r"\bc\s*est\s+possible\b", normalized_user_text)
-                or self._negotiation_step == "propose_alternative_date"
-            )
-        )
-        forced_counter = forced_counter or forced_date_counter
 
-        if forced_counter:
-            intent = "counter"
-        elif strong_accept_like:
-            intent = "accept"
-        else:
-            intent_raw = call_llm_raw(
-                [
-                    {"role": "system", "content": intent_prompt},
-                    {"role": "user", "content": user_text},
-                ],
-                num_predict=64,
-                temperature=0.0,
-            )
-            intent = (
-                str(_extract_json(intent_raw).get("intent") or "other").lower().strip()
-            )
+        action = result.get("action", "speak")
+        response_text = str(result.get("response_text", "") or "").strip()
+        intent = str(result.get("intent", "other") or "other").strip()
 
-        if intent == "accept":
-            # If we just proposed a callback, "accept" means the client accepts the
-            # callback scheduling, not the payment plan.
-            if self._negotiation_step == "propose_rappel":
-                rappel_msg = (
-                    "Très bien, je note un rappel dans 15 jours. "
-                    f"En attendant, gardez à l'esprit que votre dette de {unpaid} DT "
-                    "doit être régularisée. Bonne journée."
-                )
-                self._stt.pause()
-                try:
-                    self.speak(rappel_msg)
-                finally:
-                    self._stt.resume()
-                self._log_call_event(
-                    transcript=user_text,
-                    intent="negotiation_rappel_accepted",
-                    outcome="rappel_scheduled",
-                    agent_decision=rappel_msg,
-                    turn_number=turn_number,
-                )
-                self._negotiation_active = False
-                self._negotiation_step = "done"
-                return
-
-            # Keep previously negotiated counter values when present.
-            if self._proposed_installments == 0:
-                self._proposed_installments = max_inst
-            if self._proposed_amount == 0.0:
-                self._proposed_amount = suggested
-
-            # Bugfix: always attempt to extract a (new) payment date from the transcript.
-            extracted_date = extract_payment_date_from_transcript(user_text)
-            date_changed = bool(
-                extracted_date and extracted_date != self._proposed_date
-            )
-            if extracted_date:
-                self._proposed_date = extracted_date
-            elif not self._proposed_date:
-                self._proposed_date = first_date
-
-            # STEP 4 — Final recap confirmation before saving.
-            # If the client changes the date while "accepting" in final confirmation,
-            # force a new recap instead of saving immediately.
-            if self._negotiation_step != "await_final_confirmation" or date_changed:
-                recap_msg = (
-                    f"Pour confirmer : vous vous engagez à payer {self._proposed_installments} "
-                    f"mensualité(s) de {self._proposed_amount} DT, première échéance le "
-                    f"{self._proposed_date}. C'est bien votre accord ?"
-                )
-                self._stt.pause()
-                try:
-                    self.speak(recap_msg)
-                finally:
-                    self._stt.resume()
-                self._log_call_event(
-                    transcript=user_text,
-                    intent="negotiation_accept",
-                    outcome="prompt_final_confirmation",
-                    agent_decision=recap_msg,
-                    turn_number=turn_number,
-                )
-                self._negotiation_step = "await_final_confirmation"
-                return
-
-            self._negotiation_step = "save_promise"
+        if action == "save":
             self._save_payment_promise(
                 transcript=user_text,
                 turn_number=turn_number,
@@ -1276,279 +1114,25 @@ class VoiceAgent:
             )
             return
 
-        if intent == "counter":
-            # Deterministic pre-extract before LLM for obvious installment syntax.
-            # Clause-based extraction: ignore negated values like
-            # "je peux pas payer en 3 ..., est-ce que je peux payer en 6 ?".
-            _INST_MAP = {
-                "une": 1,
-                "un": 1,
-                "deux": 2,
-                "trois": 3,
-                "quatre": 4,
-                "cinq": 5,
-                "six": 6,
-            }
-
-            def _to_installments(token: str) -> int | None:
-                value = (token or "").strip()
-                if not value:
-                    return None
-                if value.isdigit():
-                    try:
-                        return int(value)
-                    except Exception:
-                        return None
-                return _INST_MAP.get(value)
-
-            def _norm_keep_clause_separators(text: str) -> str:
-                normalized = _ud.normalize("NFKD", (text or "").lower())
-                normalized = "".join(ch for ch in normalized if not _ud.combining(ch))
-                # Keep comma/semicolon so we can split clauses on them.
-                normalized = re.sub(r"[^a-z0-9\s,;]", " ", normalized)
-                normalized = re.sub(r"\s+", " ", normalized).strip()
-                return normalized
-
-            normalized_user_text_for_clauses = _norm_keep_clause_separators(user_text)
-            clauses = [
-                c.strip()
-                for c in re.split(
-                    r"\s*(?:[,;]|\bmais\b|\bou\b|\bdonc\b)\s*",
-                    normalized_user_text_for_clauses,
-                )
-                if c.strip()
-            ]
-
-            negation_re = re.compile(
-                r"(?:\bpas\b|\bne\s+peux\s+pas\b|\bne\s+peut\s+pas\b|\bjamais\b|\bimpossible\b|\bincapable\b)"
-            )
-            valid_installments: list[int] = []
-
-            # 1) Handle single-payment phrasing -> 1 (unless negated).
-            unique_payment_re = re.compile(
-                r"\b(une\s+seule\s+fois|d\s*un\s+coup|paiement\s+unique|tout\s+en\s+un)\b"
-            )
-            # 2) Handle "en X (fois|mensualites)"; also accepts bare "en X".
-            en_x_re = re.compile(
-                r"\ben\s+(?P<num>\d+|une|un|deux|trois|quatre|cinq|six)\b(?:\s+(?:fois|mensualit(?:e|es)))?"
-            )
-            # 3) Handle "X mensualites" without "en" (legacy behavior).
-            x_mens_re = re.compile(r"\b(?P<num>\d+)\s+mensualit(?:e|es)\b")
-
-            for clause in clauses:
-                for match in unique_payment_re.finditer(clause):
-                    if negation_re.search(clause[: match.start()]):
-                        continue
-                    valid_installments.append(1)
-
-                for match in en_x_re.finditer(clause):
-                    if negation_re.search(clause[: match.start()]):
-                        continue
-                    value = _to_installments(match.group("num"))
-                    if value is not None:
-                        valid_installments.append(value)
-
-                for match in x_mens_re.finditer(clause):
-                    if negation_re.search(clause[: match.start()]):
-                        continue
-                    try:
-                        valid_installments.append(int(match.group("num")))
-                    except Exception:
-                        continue
-
-            forced_installments: int | None = (
-                valid_installments[-1] if valid_installments else None
-            )
-
-            counter_prompt = (
-                "Extrait le nombre de mensualités ou le montant proposé par le client. "
-                'Réponds uniquement en JSON: {"installments": int|null, "amount": float|null}.'
-            )
-            counter_raw = call_llm_raw(
-                [
-                    {"role": "system", "content": counter_prompt},
-                    {"role": "user", "content": user_text},
-                ],
-                num_predict=64,
-                temperature=0.0,
-            )
-            counter_data = _extract_json(counter_raw)
-
-            inst_value = counter_data.get("installments")
-            amount_value = counter_data.get("amount")
-
-            # Regex extraction has priority over LLM output when present.
-            if forced_installments is not None:
-                inst_value = forced_installments
-
-            # Sticky negotiation fields: keep previously negotiated values unless
-            # the user explicitly proposes a new one in THIS turn.
-            prev_installments = int(self._proposed_installments or 0)
-            prev_amount = float(self._proposed_amount or 0.0)
-            prev_date = str(self._proposed_date or "").strip()
-
-            inst_explicit = inst_value is not None
-            try:
-                inst_candidate = int(inst_value) if inst_value is not None else None
-            except Exception:
-                inst_candidate = None
-            if inst_candidate is None:
-                inst_candidate = (
-                    prev_installments if prev_installments > 0 else max_inst
-                )
-
-            amount_explicit = amount_value is not None
-            try:
-                amount_candidate = (
-                    float(amount_value) if amount_value is not None else None
-                )
-            except Exception:
-                amount_candidate = None
-
-            if amount_candidate is None:
-                # If user explicitly changed installments but didn't specify an amount,
-                # recompute a sensible default for that installment count.
-                if inst_explicit and not amount_explicit:
-                    amount_candidate = round(unpaid / max(inst_candidate, 1), 2)
-                else:
-                    amount_candidate = (
-                        prev_amount
-                        if prev_amount > 0.0
-                        else round(unpaid / max(inst_candidate, 1), 2)
-                    )
-
-            extracted_date = extract_payment_date_from_transcript(user_text)
-
-            # Date-only counter: keep the current plan (installments/amount)
-            # and only update the payment date.
-            if extracted_date and not inst_explicit and not amount_explicit:
-                inst_candidate = (
-                    prev_installments if prev_installments > 0 else max_inst
-                )
-                amount_candidate = prev_amount if prev_amount > 0.0 else suggested
-
-            date_candidate = extracted_date or prev_date or first_date
-
-            inst_value = inst_candidate
-            amount_value = amount_candidate
-
-            is_valid_installments = 1 <= inst_value <= max_inst
-            is_valid_amount = float(amount_value) >= min_amount
-
-            if is_valid_installments and is_valid_amount:
-                self._proposed_installments = inst_value
-                self._proposed_amount = round(float(amount_value), 2)
-                self._proposed_date = date_candidate
-                self._negotiation_step = "await_confirmation"
+        if action == "hangup":
+            if response_text:
                 self._stt.pause()
                 try:
-                    counter_ok_msg = (
-                        f"D'accord, je note votre proposition de {self._proposed_installments} "
-                        f"mensualité(s) de {self._proposed_amount} DT. "
-                        "Confirmez-vous cet engagement ?"
-                    )
-                    self.speak(counter_ok_msg)
+                    self.speak(response_text)
                 finally:
                     self._stt.resume()
-                self._log_call_event(
-                    transcript=user_text,
-                    intent="negotiation_counter",
-                    outcome="counter_accepted",
-                    agent_decision=counter_ok_msg,
-                    turn_number=turn_number,
-                )
-                return
-
-            invalid_counter_msg = (
-                "Je ne peux pas valider cette proposition. "
-                f"Le maximum autorisé est {max_inst} mensualités, "
-                f"avec un minimum de {min_amount} DT par mensualité. "
-                "Pouvez-vous accepter ce cadre ?"
-            )
-            self._stt.pause()
-            try:
-                self.speak(invalid_counter_msg)
-            finally:
-                self._stt.resume()
-            self._log_call_event(
-                transcript=user_text,
-                intent="negotiation_counter",
-                outcome="counter_rejected",
-                agent_decision=invalid_counter_msg,
-                turn_number=turn_number,
-            )
-            self._negotiation_step = "await_confirmation"
-            return
-
-        if intent == "refuse":
-            # STEP 3 — Progressive refusal escalation with alternatives.
-            self._negotiation_refusals += 1
-
-            if self._negotiation_refusals == 1:
-                message = (
-                    "Je comprends. Est-ce qu'une date d'échéance différente vous conviendrait mieux ? "
-                    "Par exemple, le 20 du mois ?"
-                )
-                next_step = "propose_alternative_date"
-                outcome = "refuse_stage_1_alternative_date"
-            elif self._negotiation_refusals == 2:
-                acompte_installments = 1
-                self._proposed_installments = acompte_installments
-                self._proposed_amount = float(min_amount)
-                if not self._proposed_date:
-                    self._proposed_date = first_date
-
-                message = (
-                    f"Pouvez-vous au moins verser un acompte de {min_amount} DT maintenant, "
-                    f"et régler le reste en {max(max_inst - 1, 1)} fois ?"
-                )
-                next_step = "propose_acompte"
-                outcome = "refuse_stage_2_acompte"
-            elif self._negotiation_refusals == 3:
-                # Reset to the standard plan: accepting a callback should not
-                # inherit the acompte proposal values.
-                self._proposed_installments = max_inst
-                self._proposed_amount = suggested
-                if not self._proposed_date:
-                    self._proposed_date = first_date
-
-                message = (
-                    "Je comprends votre situation. Je peux vous rappeler dans 15 jours. "
-                    "Est-ce que ça vous convient ?"
-                )
-                next_step = "propose_rappel"
-                outcome = "refuse_stage_3_rappel"
-            else:
-                # Final stage: hang up with legal warning.
-                message = (
-                    "Je prends note de votre refus. Sans régularisation, des actions légales peuvent être engagées. "
-                    "Au revoir."
-                )
-                next_step = "hangup"
-                outcome = "hangup"
-
-            self._stt.pause()
-            try:
-                self.speak(message)
-            finally:
-                self._stt.resume()
-
             self._log_call_event(
                 transcript=user_text,
                 intent="negotiation_refuse",
-                outcome=outcome,
-                agent_decision=message,
+                outcome="hangup",
+                agent_decision=response_text,
                 turn_number=turn_number,
             )
-
-            self._negotiation_step = next_step
-            if next_step == "hangup":
-                Thread(target=self.shutdown, daemon=True).start()
-                return
-
+            self._negotiation_active = False
+            Thread(target=self.shutdown, daemon=True).start()
             return
 
-        if intent == "question":
+        if action == "rag":
             state = run_voice_agent_prepare(user_text, customer_id=self._customer_id)
             rag = (state.get("rag_context") or "").strip()
             tool_res = state.get("tool_results") or []
@@ -1610,43 +1194,24 @@ class VoiceAgent:
             self._negotiation_step = "await_confirmation"
             return
 
-        # Use negotiated values if available, otherwise fall back to profile defaults.
-        display_inst = (
-            self._proposed_installments if self._proposed_installments > 0 else max_inst
-        )
-        display_amount = (
-            self._proposed_amount if self._proposed_amount > 0.0 else suggested
-        )
+        # Default: speak whatever the graph decided
+        if response_text:
+            self._stt.pause()
+            try:
+                self.speak(response_text)
+            finally:
+                self._stt.resume()
 
-        if self._negotiation_step == "await_final_confirmation":
-            fallback_other_msg = (
-                f"Désolé, je n'ai pas compris. Pour confirmer : "
-                f"{display_inst} mensualité(s) de {display_amount} DT, "
-                f"première échéance le {self._proposed_date}. "
-                "Oui ou non ?"
-            )
-        else:
-            fallback_other_msg = (
-                "Je n'ai pas bien compris. "
-                f"Confirmez-vous le plan de {display_inst} mensualité(s) "
-                f"de {display_amount} DT ?"
-            )
-
-        self._stt.pause()
-        try:
-            self.speak(fallback_other_msg)
-        finally:
-            self._stt.resume()
         self._log_call_event(
             transcript=user_text,
-            intent="negotiation_other",
-            outcome="clarification",
-            agent_decision=fallback_other_msg,
+            intent=f"negotiation_{intent}",
+            outcome=self._negotiation_step,
+            agent_decision=response_text,
             turn_number=turn_number,
         )
-        # Do NOT reset negotiation_step if we are awaiting final confirmation.
-        if self._negotiation_step != "await_final_confirmation":
-            self._negotiation_step = "await_confirmation"
+
+        if self._negotiation_step == "done":
+            self._negotiation_active = False
         return
 
     def _handle_name_confirmation(self, user_text: str, turn_number: int) -> None:

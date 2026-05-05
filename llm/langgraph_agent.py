@@ -20,10 +20,10 @@ from db.tools import create_claim, create_payment_promise, get_client_info, log_
 
 try:
     # Package mode: python -m llm.langgraph_agent
-    from llm.agent import generate_ai_response, call_llm_raw
+    from llm.agent import call_llm_raw
 except ModuleNotFoundError:
     # Script mode: uv run llm/langgraph_agent.py
-    from agent import generate_ai_response, call_llm_raw
+    from agent import call_llm_raw
 
 
 class AgentState(TypedDict):
@@ -906,6 +906,608 @@ def extract_payment_date_from_transcript(transcript: str) -> str | None:
         return None
 
 
+# ---------------------------
+# Negotiation LangGraph
+# ---------------------------
+
+
+class NegotiationState(TypedDict):
+    # Input
+    user_text: str
+    negotiation_step: str
+    client_reason: str
+    proposed_installments: int
+    proposed_amount: float
+    proposed_date: str
+    negotiation_refusals: int
+    profile: dict
+    client_info: dict
+
+    # Internal
+    intent: str
+
+    # Output decided by the graph
+    action: str  # "speak" | "save" | "hangup" | "rag"
+    response_text: str
+    next_step: str
+
+    # Updated values
+    new_installments: int
+    new_amount: float
+    new_date: str
+    new_refusals: int
+
+
+def _detect_intent_node(state: NegotiationState) -> dict:
+    """Detect intent: accept/counter/refuse/question/other."""
+
+    import json
+    import unicodedata as _ud
+
+    user_text = state.get("user_text", "") or ""
+
+    def _extract_json(raw: str) -> dict:
+        try:
+            match = re.search(r"\{.*?\}", raw or "", flags=re.DOTALL)
+            if not match:
+                return {}
+            payload = json.loads(match.group(0))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    # Deterministic pre-check before LLM: force counter intent for
+    # "payer en X fois", "une seule fois", "paiement unique", etc.
+    def _norm(text: str) -> str:
+        normalized = _ud.normalize("NFKD", (text or "").lower())
+        normalized = "".join(ch for ch in normalized if not _ud.combining(ch))
+        normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized
+
+    normalized_user_text = _norm(user_text)
+
+    counter_patterns = [
+        r"\ben\s+(une?|1|deux|2|trois|3|quatre|4|cinq|5|six|6)\s+(seule?\s+)?fois\b",
+        r"\bpayer\s+en\s+(une?|1|deux|2|trois|3|quatre|4|cinq|5|six|6)\b",
+        r"\b(une?|1)\s+seule?\s+fois\b",
+        r"\btout\s+(d\s*un|en\s+un)\s+coup\b",
+        r"\bpayer\s+tout\s+(d\s*un|en\s+un)\b",
+        r"\bpaiement\s+unique\b",
+        r"\ben\s+(\d+)\s+fois\b",
+        r"\b(\d+)\s+mensualit",
+    ]
+
+    strong_accept_markers = [
+        "j accepte",
+        "je confirme",
+        "c est bon",
+        "d accord",
+        "parfait",
+    ]
+    strong_accept_like = any(
+        marker in normalized_user_text for marker in strong_accept_markers
+    )
+    if "accepte pas" in normalized_user_text:
+        strong_accept_like = False
+
+    extracted_date_precheck = extract_payment_date_from_transcript(user_text)
+    date_counter_patterns = [
+        r"\bdate\s+d\s*echeance\b",
+        r"\bl\s*echeance\s+(?:le\s+)?\d{1,2}\b",
+        r"\bje\s+veux\s+(?:que\s+)?la\s+date\b",
+        r"\bdate\b",
+        r"\becheance\b",
+    ]
+
+    forced_counter = any(
+        re.search(pattern, normalized_user_text) for pattern in counter_patterns
+    )
+    forced_date_counter = (
+        bool(extracted_date_precheck)
+        and (not strong_accept_like)
+        and (
+            any(
+                re.search(pattern, normalized_user_text)
+                for pattern in date_counter_patterns
+            )
+            or re.search(r"\bc\s*est\s+possible\b", normalized_user_text)
+            or state.get("negotiation_step") == "propose_alternative_date"
+        )
+    )
+    forced_counter = forced_counter or forced_date_counter
+
+    if forced_counter:
+        return {"intent": "counter"}
+    if strong_accept_like:
+        return {"intent": "accept"}
+
+    intent_prompt = (
+        "Détecte l'intention du client dans sa réponse à une proposition de plan de paiement. "
+        "Choisis exactement une valeur parmi: accept, counter, refuse, question, other. "
+        "accept: oui, d'accord, ok, je confirme, c'est bon, parfait, j'accepte. "
+        "  N'EST PAS accept: toute phrase qui mentionne un nombre de fois ou un montant différent. "
+        "counter: le client propose un autre montant ou un autre nombre de mensualités. "
+        "refuse: non, impossible, je ne peux pas, je refuse. "
+        "question: le client pose une question générale sur la banque ou la loi. "
+        "N'est PAS une question: proposer un autre nombre de mensualités. "
+        'Réponds uniquement en JSON: {"intent": "accept"|"counter"|"refuse"|"question"|"other"}.'
+    )
+
+    intent_raw = call_llm_raw(
+        [
+            {"role": "system", "content": intent_prompt},
+            {"role": "user", "content": user_text},
+        ],
+        num_predict=64,
+        temperature=0.0,
+    )
+    intent = str(_extract_json(intent_raw).get("intent") or "other").lower().strip()
+    if intent not in {"accept", "counter", "refuse", "question", "other"}:
+        intent = "other"
+    return {"intent": intent}
+
+
+def _accept_node(state: NegotiationState) -> dict:
+    profile = state.get("profile") or {}
+    client = state.get("client_info") or {}
+
+    max_inst = int(profile.get("max_installments") or 3)
+    suggested = float(profile.get("suggested_amount") or 0.0)
+    first_date = str(profile.get("first_payment_date") or "").strip()
+    unpaid = float(client.get("unpaid_amount") or 0.0)
+
+    negotiation_step = str(state.get("negotiation_step") or "await_confirmation")
+    user_text = state.get("user_text", "") or ""
+
+    # Special case: callback acceptance
+    if negotiation_step == "propose_rappel":
+        rappel_msg = (
+            "Très bien, je note un rappel dans 15 jours. "
+            f"En attendant, gardez à l'esprit que votre dette de {unpaid} DT "
+            "doit être régularisée. Bonne journée."
+        )
+        return {
+            "action": "speak",
+            "response_text": rappel_msg,
+            "next_step": "done",
+            "new_installments": int(state.get("proposed_installments") or 0),
+            "new_amount": float(state.get("proposed_amount") or 0.0),
+            "new_date": str(state.get("proposed_date") or ""),
+            "new_refusals": int(state.get("negotiation_refusals") or 0),
+        }
+
+    inst = int(state.get("proposed_installments") or 0) or max_inst
+    amount = float(state.get("proposed_amount") or 0.0) or suggested
+
+    extracted_date = extract_payment_date_from_transcript(user_text)
+    current_date = str(state.get("proposed_date") or "").strip()
+    date_changed = bool(extracted_date and extracted_date != current_date)
+    if extracted_date:
+        current_date = extracted_date
+    if not current_date:
+        current_date = first_date
+
+    if negotiation_step != "await_final_confirmation" or date_changed:
+        recap = (
+            f"Pour confirmer : vous vous engagez à payer {inst} "
+            f"mensualité(s) de {amount} DT, première échéance le "
+            f"{current_date}. C'est bien votre accord ?"
+        )
+        return {
+            "action": "speak",
+            "response_text": recap,
+            "next_step": "await_final_confirmation",
+            "new_installments": inst,
+            "new_amount": round(float(amount), 2),
+            "new_date": current_date,
+            "new_refusals": int(state.get("negotiation_refusals") or 0),
+        }
+
+    return {
+        "action": "save",
+        "response_text": "",
+        "next_step": "save_promise",
+        "new_installments": inst,
+        "new_amount": round(float(amount), 2),
+        "new_date": current_date,
+        "new_refusals": int(state.get("negotiation_refusals") or 0),
+    }
+
+
+def _counter_node(state: NegotiationState) -> dict:
+    import json
+    import unicodedata as _ud
+
+    profile = state.get("profile") or {}
+    client = state.get("client_info") or {}
+
+    max_inst = int(profile.get("max_installments") or 3)
+    suggested = float(profile.get("suggested_amount") or 0.0)
+    first_date = str(profile.get("first_payment_date") or "").strip()
+    unpaid = float(client.get("unpaid_amount") or 0.0)
+    min_amount = round((unpaid / max_inst) * 0.8, 2) if max_inst > 0 else 0.0
+
+    user_text = state.get("user_text", "") or ""
+
+    def _extract_json(raw: str) -> dict:
+        try:
+            match = re.search(r"\{.*?\}", raw or "", flags=re.DOTALL)
+            if not match:
+                return {}
+            payload = json.loads(match.group(0))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    _INST_MAP = {
+        "une": 1,
+        "un": 1,
+        "deux": 2,
+        "trois": 3,
+        "quatre": 4,
+        "cinq": 5,
+        "six": 6,
+    }
+
+    def _to_installments(token: str) -> int | None:
+        value = (token or "").strip()
+        if not value:
+            return None
+        if value.isdigit():
+            try:
+                return int(value)
+            except Exception:
+                return None
+        return _INST_MAP.get(value)
+
+    def _norm_keep_clause_separators(text: str) -> str:
+        normalized = _ud.normalize("NFKD", (text or "").lower())
+        normalized = "".join(ch for ch in normalized if not _ud.combining(ch))
+        normalized = re.sub(r"[^a-z0-9\s,;]", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized
+
+    normalized_user_text_for_clauses = _norm_keep_clause_separators(user_text)
+    clauses = [
+        c.strip()
+        for c in re.split(
+            r"\s*(?:[,;]|\bmais\b|\bou\b|\bdonc\b)\s*",
+            normalized_user_text_for_clauses,
+        )
+        if c.strip()
+    ]
+
+    negation_re = re.compile(
+        r"(?:\bpas\b|\bne\s+peux\s+pas\b|\bne\s+peut\s+pas\b|\bjamais\b|\bimpossible\b|\bincapable\b)"
+    )
+    valid_installments: list[int] = []
+
+    unique_payment_re = re.compile(
+        r"\b(une\s+seule\s+fois|d\s*un\s+coup|paiement\s+unique|tout\s+en\s+un)\b"
+    )
+    en_x_re = re.compile(
+        r"\ben\s+(?P<num>\d+|une|un|deux|trois|quatre|cinq|six)\b(?:\s+(?:fois|mensualit(?:e|es)))?"
+    )
+    x_mens_re = re.compile(r"\b(?P<num>\d+)\s+mensualit(?:e|es)\b")
+
+    for clause in clauses:
+        for match in unique_payment_re.finditer(clause):
+            if negation_re.search(clause[: match.start()]):
+                continue
+            valid_installments.append(1)
+
+        for match in en_x_re.finditer(clause):
+            if negation_re.search(clause[: match.start()]):
+                continue
+            value = _to_installments(match.group("num"))
+            if value is not None:
+                valid_installments.append(value)
+
+        for match in x_mens_re.finditer(clause):
+            if negation_re.search(clause[: match.start()]):
+                continue
+            try:
+                valid_installments.append(int(match.group("num")))
+            except Exception:
+                continue
+
+    forced_installments: int | None = (
+        valid_installments[-1] if valid_installments else None
+    )
+
+    counter_prompt = (
+        "Extrait le nombre de mensualités ou le montant proposé par le client. "
+        'Réponds uniquement en JSON: {"installments": int|null, "amount": float|null}.'
+    )
+    counter_raw = call_llm_raw(
+        [
+            {"role": "system", "content": counter_prompt},
+            {"role": "user", "content": user_text},
+        ],
+        num_predict=64,
+        temperature=0.0,
+    )
+    counter_data = _extract_json(counter_raw)
+    inst_value = counter_data.get("installments")
+    amount_value = counter_data.get("amount")
+
+    if forced_installments is not None:
+        inst_value = forced_installments
+
+    prev_installments = int(state.get("proposed_installments") or 0)
+    prev_amount = float(state.get("proposed_amount") or 0.0)
+    prev_date = str(state.get("proposed_date") or "").strip()
+
+    inst_explicit = inst_value is not None
+    try:
+        inst_candidate = int(inst_value) if inst_value is not None else None
+    except Exception:
+        inst_candidate = None
+    if inst_candidate is None:
+        inst_candidate = prev_installments if prev_installments > 0 else max_inst
+
+    amount_explicit = amount_value is not None
+    try:
+        amount_candidate = float(amount_value) if amount_value is not None else None
+    except Exception:
+        amount_candidate = None
+
+    if amount_candidate is None:
+        if inst_explicit and not amount_explicit:
+            amount_candidate = round(unpaid / max(inst_candidate, 1), 2)
+        else:
+            amount_candidate = (
+                prev_amount
+                if prev_amount > 0.0
+                else round(unpaid / max(inst_candidate, 1), 2)
+            )
+
+    extracted_date = extract_payment_date_from_transcript(user_text)
+    if extracted_date and not inst_explicit and not amount_explicit:
+        inst_candidate = prev_installments if prev_installments > 0 else max_inst
+        amount_candidate = prev_amount if prev_amount > 0.0 else suggested
+
+    date_candidate = extracted_date or prev_date or first_date
+
+    is_valid_installments = 1 <= int(inst_candidate) <= max_inst
+    is_valid_amount = float(amount_candidate) >= min_amount
+
+    if is_valid_installments and is_valid_amount:
+        counter_ok_msg = (
+            f"D'accord, je note votre proposition de {int(inst_candidate)} "
+            f"mensualité(s) de {round(float(amount_candidate), 2)} DT. "
+            "Confirmez-vous cet engagement ?"
+        )
+        return {
+            "action": "speak",
+            "response_text": counter_ok_msg,
+            "next_step": "await_confirmation",
+            "new_installments": int(inst_candidate),
+            "new_amount": round(float(amount_candidate), 2),
+            "new_date": date_candidate,
+            "new_refusals": int(state.get("negotiation_refusals") or 0),
+        }
+
+    invalid_counter_msg = (
+        "Je ne peux pas valider cette proposition. "
+        f"Le maximum autorisé est {max_inst} mensualités, "
+        f"avec un minimum de {min_amount} DT par mensualité. "
+        "Pouvez-vous accepter ce cadre ?"
+    )
+    return {
+        "action": "speak",
+        "response_text": invalid_counter_msg,
+        "next_step": "await_confirmation",
+        "new_installments": prev_installments,
+        "new_amount": prev_amount,
+        "new_date": prev_date,
+        "new_refusals": int(state.get("negotiation_refusals") or 0),
+    }
+
+
+def _refuse_node(state: NegotiationState) -> dict:
+    profile = state.get("profile") or {}
+    client = state.get("client_info") or {}
+
+    max_inst = int(profile.get("max_installments") or 3)
+    suggested = float(profile.get("suggested_amount") or 0.0)
+    first_date = str(profile.get("first_payment_date") or "").strip()
+
+    unpaid = float(client.get("unpaid_amount") or 0.0)
+    min_amount = round((unpaid / max_inst) * 0.8, 2) if max_inst > 0 else 0.0
+
+    refusals = int(state.get("negotiation_refusals") or 0) + 1
+
+    if refusals == 1:
+        msg = (
+            "Je comprends. Est-ce qu'une date d'échéance différente vous conviendrait mieux ? "
+            "Par exemple, le 20 du mois ?"
+        )
+        next_step = "propose_alternative_date"
+        return {
+            "action": "speak",
+            "response_text": msg,
+            "next_step": next_step,
+            "new_installments": int(state.get("proposed_installments") or 0),
+            "new_amount": float(state.get("proposed_amount") or 0.0),
+            "new_date": str(state.get("proposed_date") or ""),
+            "new_refusals": refusals,
+        }
+
+    if refusals == 2:
+        msg = (
+            f"Pouvez-vous au moins verser un acompte de {min_amount} DT maintenant, "
+            f"et régler le reste en {max(max_inst - 1, 1)} fois ?"
+        )
+        next_step = "propose_acompte"
+        new_date = str(state.get("proposed_date") or "").strip() or first_date
+        return {
+            "action": "speak",
+            "response_text": msg,
+            "next_step": next_step,
+            "new_installments": 1,
+            "new_amount": float(min_amount),
+            "new_date": new_date,
+            "new_refusals": refusals,
+        }
+
+    if refusals == 3:
+        msg = (
+            "Je comprends votre situation. Je peux vous rappeler dans 15 jours. "
+            "Est-ce que ça vous convient ?"
+        )
+        next_step = "propose_rappel"
+        new_date = str(state.get("proposed_date") or "").strip() or first_date
+        return {
+            "action": "speak",
+            "response_text": msg,
+            "next_step": next_step,
+            "new_installments": max_inst,
+            "new_amount": suggested,
+            "new_date": new_date,
+            "new_refusals": refusals,
+        }
+
+    msg = (
+        "Je prends note de votre refus. Sans régularisation, des actions légales peuvent être engagées. "
+        "Au revoir."
+    )
+    return {
+        "action": "hangup",
+        "response_text": msg,
+        "next_step": "hangup",
+        "new_installments": int(state.get("proposed_installments") or 0),
+        "new_amount": float(state.get("proposed_amount") or 0.0),
+        "new_date": str(state.get("proposed_date") or ""),
+        "new_refusals": refusals,
+    }
+
+
+def _question_node(state: NegotiationState) -> dict:
+    return {
+        "action": "rag",
+        "response_text": "",
+        "next_step": "await_confirmation",
+        "new_installments": int(state.get("proposed_installments") or 0),
+        "new_amount": float(state.get("proposed_amount") or 0.0),
+        "new_date": str(state.get("proposed_date") or ""),
+        "new_refusals": int(state.get("negotiation_refusals") or 0),
+    }
+
+
+def _other_node(state: NegotiationState) -> dict:
+    profile = state.get("profile") or {}
+
+    inst = int(state.get("proposed_installments") or 0) or int(
+        profile.get("max_installments") or 3
+    )
+    amount = float(state.get("proposed_amount") or 0.0) or float(
+        profile.get("suggested_amount") or 0.0
+    )
+    proposed_date = str(state.get("proposed_date") or "").strip()
+
+    negotiation_step = str(state.get("negotiation_step") or "await_confirmation")
+    if negotiation_step == "await_final_confirmation":
+        msg = (
+            f"Désolé, je n'ai pas compris. Pour confirmer : "
+            f"{inst} mensualité(s) de {amount} DT, "
+            f"première échéance le {proposed_date}. "
+            "Oui ou non ?"
+        )
+        next_step = negotiation_step
+    else:
+        msg = (
+            "Je n'ai pas bien compris. "
+            f"Confirmez-vous le plan de {inst} mensualité(s) "
+            f"de {amount} DT ?"
+        )
+        next_step = "await_confirmation"
+
+    return {
+        "action": "speak",
+        "response_text": msg,
+        "next_step": next_step,
+        "new_installments": int(state.get("proposed_installments") or 0),
+        "new_amount": float(state.get("proposed_amount") or 0.0),
+        "new_date": proposed_date,
+        "new_refusals": int(state.get("negotiation_refusals") or 0),
+    }
+
+
+def _route_after_intent(state: NegotiationState) -> str:
+    return str(state.get("intent") or "other")
+
+
+def build_negotiation_graph():
+    from langgraph.graph import END, StateGraph
+
+    graph = StateGraph(NegotiationState)
+
+    graph.add_node("detect_intent", _detect_intent_node)
+    graph.add_node("accept", _accept_node)
+    graph.add_node("counter", _counter_node)
+    graph.add_node("refuse", _refuse_node)
+    graph.add_node("question", _question_node)
+    graph.add_node("other", _other_node)
+
+    graph.set_entry_point("detect_intent")
+
+    graph.add_conditional_edges(
+        "detect_intent",
+        _route_after_intent,
+        {
+            "accept": "accept",
+            "counter": "counter",
+            "refuse": "refuse",
+            "question": "question",
+            "other": "other",
+        },
+    )
+
+    for node in ["accept", "counter", "refuse", "question", "other"]:
+        graph.add_edge(node, END)
+
+    return graph.compile()
+
+
+_negotiation_app = build_negotiation_graph()
+
+
+def run_negotiation_graph(
+    user_text: str,
+    negotiation_step: str,
+    proposed_installments: int,
+    proposed_amount: float,
+    proposed_date: str,
+    negotiation_refusals: int,
+    profile: dict,
+    client_info: dict,
+    client_reason: str = "unknown",
+) -> dict:
+    initial_state: NegotiationState = {
+        "user_text": user_text,
+        "negotiation_step": negotiation_step,
+        "proposed_installments": int(proposed_installments or 0),
+        "proposed_amount": float(proposed_amount or 0.0),
+        "proposed_date": str(proposed_date or ""),
+        "negotiation_refusals": int(negotiation_refusals or 0),
+        "profile": profile or {},
+        "client_info": client_info or {},
+        "client_reason": client_reason or "unknown",
+        "action": "",
+        "response_text": "",
+        "next_step": negotiation_step,
+        "new_installments": int(proposed_installments or 0),
+        "new_amount": float(proposed_amount or 0.0),
+        "new_date": str(proposed_date or ""),
+        "new_refusals": int(negotiation_refusals or 0),
+        "intent": "",
+    }
+
+    return _negotiation_app.invoke(initial_state, config={"recursion_limit": 5})
+
+
 def _classify_intent(transcript: str, tool_results: list) -> dict:
     import json
     import re
@@ -1565,4 +2167,12 @@ if __name__ == "__main__":
     except ImportError:
         png_bytes = graph.get_graph().draw_mermaid_png()
         with open("graph.png", "wb") as file:
+            file.write(png_bytes)
+
+    negotiation_graph = build_negotiation_graph()
+    try:
+        negotiation_graph.get_graph().draw_png("negotiation_graph.png")
+    except ImportError:
+        png_bytes = negotiation_graph.get_graph().draw_mermaid_png()
+        with open("negotiation_graph.png", "wb") as file:
             file.write(png_bytes)
