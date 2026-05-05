@@ -42,7 +42,6 @@ from tts import speak_streaming, warmup_tts
 
 OUTBOUND_GREETING = (
     "Bonjour, je suis l'assistant de recouvrement de votre établissement bancaire. Je vous contacte aujourd'hui concernant des échéances impayées sur votre compte. Afin de traiter votre dossier, j'ai besoin de vérifier votre identité. "
-    "Pouvez-vous me communiquer votre date de naissance ?"
 )
 
 
@@ -258,6 +257,11 @@ class VoiceAgent:
         self._negotiation_refusals: int = 0
         self._client_reason: str = "unknown"
         self._client_reason_raw: str = ""
+
+        self._claim_active: bool = False
+        self._claim_step: str = ""  # "await_subject" | "await_body"
+        self._claim_subject: str = ""
+        self._claim_body: str = ""
 
         self._shutdown_event = Event()
         self._processing_lock = Lock()
@@ -565,6 +569,49 @@ class VoiceAgent:
                 )
                 self._awaiting_dob = True
                 return
+
+            # Claim detection — triggered even during active negotiation
+            if self._claim_active:
+                self._handle_claim_turn(user_text, current_turn)
+                return
+
+            # Claim trigger detection — check if client wants to file a claim
+            if self._verified and not self._claim_active:
+                claim_keywords = [
+                    "réclamation",
+                    "réclamer",
+                    "signaler un problème",
+                    "j'ai déjà payé",
+                    "erreur sur",
+                    "contester",
+                    "plainte",
+                    "problème avec mon compte",
+                    "paiement non enregistré",
+                    "décalage",
+                    "restructuration",
+                ]
+                user_lower = user_text.lower()
+                if any(kw in user_lower for kw in claim_keywords):
+                    self._claim_active = True
+                    self._claim_step = "await_subject"
+                    self._stt.pause()
+                    try:
+                        self.speak(
+                            "Je comprends que vous souhaitez déposer une réclamation. "
+                            "Quel est le sujet ? Par exemple : erreur sur montant, "
+                            "paiement non enregistré, demande de décalage, "
+                            "restructuration, comportement inapproprié, ou autre ?"
+                        )
+                    finally:
+                        self._stt.resume()
+                    self._log_call_event(
+                        transcript=user_text,
+                        intent="claim_trigger",
+                        outcome="claim_started",
+                        agent_decision="Claim flow initiated",
+                        turn_number=current_turn,
+                    )
+                    return
 
             if self._verified and self._negotiation_active:
                 self._handle_negotiation_turn(user_text, current_turn)
@@ -907,6 +954,43 @@ class VoiceAgent:
             classify_client_profile,
             extract_payment_date_from_transcript,
         )
+
+        # Claim detection BEFORE any intent logic
+        claim_keywords = [
+            "réclamation",
+            "réclamer",
+            "signaler un problème",
+            "j'ai déjà payé",
+            "erreur sur",
+            "contester",
+            "plainte",
+            "problème avec mon compte",
+            "paiement non enregistré",
+            "décalage",
+            "restructuration",
+        ]
+        user_lower = (user_text or "").lower()
+        if any(kw in user_lower for kw in claim_keywords):
+            self._claim_active = True
+            self._claim_step = "await_subject"
+            self._stt.pause()
+            try:
+                self.speak(
+                    "Je comprends que vous souhaitez déposer une réclamation. "
+                    "Quel est le sujet ? Par exemple : erreur sur montant, "
+                    "paiement non enregistré, demande de décalage, "
+                    "restructuration, comportement inapproprié, ou autre ?"
+                )
+            finally:
+                self._stt.resume()
+            self._log_call_event(
+                transcript=user_text,
+                intent="claim_trigger",
+                outcome="claim_started_during_negotiation",
+                agent_decision="Claim flow initiated during negotiation",
+                turn_number=turn_number,
+            )
+            return
 
         # STEP 2 — Handle reason capture before any other negotiation logic.
         if self._negotiation_step == "await_reason":
@@ -1442,14 +1526,15 @@ class VoiceAgent:
 
             # Always anchor the answer to the currently proposed negotiation plan.
             system_msg = (
-                "Tu es un conseiller bancaire tunisien au téléphone. "
-                "Réponds uniquement à la question posée de manière claire et courte. "
-                f"Le plan proposé actuellement est: {max_inst} mensualités de {suggested} DT, "
-                f"première échéance le {first_date}. "
-                f"Le client peut choisir entre 1 et {max_inst} mensualités maximum. "
-                "Si le client demande s'il peut payer en X fois et que X <= max autorisé, "
-                "réponds OUI directement et confirme que c'est possible. "
-                "Ne mentionne pas les conditions bancaires générales ni les articles juridiques. "
+                "Tu es un agent de recouvrement bancaire tunisien au téléphone. "
+                "Réponds à la question de manière simple et courte, "
+                "en reliant la réponse au contexte du recouvrement de dette. "
+                "Ne cite pas d'articles juridiques. "
+                "Si la question concerne une procédure légale, explique "
+                "ce que ça signifie concrètement pour le client. "
+                "Si la question porte sur une mise en demeure, définis-la comme une lettre formelle "
+                "envoyée par le créancier (ou son avocat) au débiteur, demandant de payer dans un délai précis, "
+                "avant d'éventuelles poursuites judiciaires; ce n'est pas un acte d'un juge. "
                 "Réponds exclusivement en français. Maximum 2 phrases."
             )
 
@@ -1601,6 +1686,130 @@ class VoiceAgent:
                 agent_decision=fallback_msg,
                 turn_number=turn_number,
             )
+
+    def _handle_claim_turn(self, user_text: str, turn_number: int) -> None:
+        from llm.agent import call_llm_raw
+
+        if self._claim_step == "await_subject":
+            subject_prompt = (
+                "Classe la réclamation du client parmi ces sujets exactement. "
+                "Réponds UNIQUEMENT avec le sujet exact, rien d'autre, en JSON. "
+                "Sujets valides: "
+                "'Erreur sur montant impayé', "
+                "'Paiement effectué non enregistré', "
+                "'Demande de décalage échéance', "
+                "'Demande de restructuration', "
+                "'Comportement inapproprié', "
+                "'Autre réclamation'. "
+                'Réponds uniquement en JSON: {"subject": "..."}'
+            )
+            import json as _json
+
+            raw = call_llm_raw(
+                [
+                    {"role": "system", "content": subject_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                num_predict=64,
+                temperature=0.0,
+            )
+            # Parse subject from LLM response
+            subject = "Autre réclamation"  # safe default
+            try:
+                match = re.search(r"\{.*?\}", (raw or ""), flags=re.DOTALL)
+                if match:
+                    parsed = _json.loads(match.group(0))
+                    candidate = str(parsed.get("subject", "")).strip()
+                    valid_subjects = {
+                        "Erreur sur montant impayé",
+                        "Paiement effectué non enregistré",
+                        "Demande de décalage échéance",
+                        "Demande de restructuration",
+                        "Comportement inapproprié",
+                        "Autre réclamation",
+                    }
+                    if candidate in valid_subjects:
+                        subject = candidate
+            except Exception:
+                pass
+
+            self._claim_subject = subject
+            self._claim_step = "await_body"
+
+            self._stt.pause()
+            try:
+                self.speak(
+                    f"J'ai bien noté : {subject}. "
+                    "Pouvez-vous décrire brièvement votre problème en quelques mots ?"
+                )
+            finally:
+                self._stt.resume()
+
+            self._log_call_event(
+                transcript=user_text,
+                intent="claim_subject",
+                outcome=f"subject_classified_{subject}",
+                agent_decision=f"Subject: {subject}",
+                turn_number=turn_number,
+            )
+            return
+
+        if self._claim_step == "await_body":
+            self._claim_body = user_text
+            self._save_claim(turn_number)
+            return
+
+    def _save_claim(self, turn_number: int) -> None:
+        from db.tools import create_claim
+
+        client = self._client_info or {}
+        try:
+            result = create_claim(
+                customer_id=self._customer_id,
+                subject=self._claim_subject,
+                body=self._claim_body,
+                name=str(client.get("customer_name", "")),
+                phone=str(client.get("telephone_1", "")),
+                email=str(client.get("email", "")),
+            )
+            if result.get("success"):
+                claim_id = result.get("id_acm_claims", "")
+                msg = (
+                    f"Votre réclamation a bien été enregistrée "
+                    f"sous le numéro {claim_id}. "
+                    "Notre équipe vous contactera dans les plus brefs délais. "
+                    "Y a-t-il autre chose que je puisse faire pour vous ?"
+                )
+                outcome = "claim_saved"
+            else:
+                msg = (
+                    "Votre réclamation a été notée. "
+                    "Notre équipe va traiter votre demande rapidement."
+                )
+                outcome = "claim_save_failed"
+        except Exception as exc:
+            _log(f"[CLAIM] save failed: {exc}")
+            msg = (
+                "Votre réclamation a été notée. Notre équipe va traiter votre demande."
+            )
+            outcome = "claim_exception"
+
+        self._stt.pause()
+        try:
+            self.speak(msg)
+        finally:
+            self._stt.resume()
+
+        self._claim_active = False
+        self._claim_step = ""
+
+        self._log_call_event(
+            transcript=self._claim_body,
+            intent="claim_save",
+            outcome=outcome,
+            agent_decision=msg,
+            turn_number=turn_number,
+        )
 
     def _log_call_event(
         self,
