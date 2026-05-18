@@ -1,16 +1,19 @@
+import asyncio
+import json
 import uuid
 from datetime import date, datetime
 from typing import Any, Optional
 
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg2.extras import RealDictCursor
 from starlette.concurrency import run_in_threadpool
 
 from db.database import get_connection
 from db.tools import get_client_info
-from llm.langgraph_agent import classify_client_profile  
+from llm.langgraph_agent import classify_client_profile
+
 load_dotenv(override=True)
 
 app = FastAPI()
@@ -22,6 +25,114 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Active calls registry
+# key: call_id (str uuid)
+# value: dict with agent_ws, client_ws, customer_id, status
+active_calls: dict[str, dict] = {}
+active_calls_lock = asyncio.Lock()
+
+
+def _safe_set_status(call_id: str, status: str) -> None:
+    call = active_calls.get(call_id)
+    if call is None:
+        return
+    call["status"] = status
+
+
+def _update_status_from_message(call_id: str, message_text: str) -> None:
+    try:
+        payload = json.loads(message_text)
+    except Exception:
+        return
+
+    if not isinstance(payload, dict):
+        return
+
+    msg_type = payload.get("type")
+    if msg_type == "call_accepted":
+        _safe_set_status(call_id, "accepted")
+    elif msg_type == "call_rejected":
+        _safe_set_status(call_id, "rejected")
+    elif msg_type == "call_ended":
+        _safe_set_status(call_id, "ended")
+    elif msg_type == "ringing":
+        _safe_set_status(call_id, "ringing")
+
+
+async def relay_messages(sender: WebSocket, receiver_getter, call_id: str, side: str):
+    try:
+        while True:
+            data = await sender.receive_text()
+            _update_status_from_message(call_id, data)
+            receiver = receiver_getter()
+            if receiver:
+                await receiver.send_text(data)
+    except WebSocketDisconnect:
+        # Don't overwrite an explicit reject status.
+        if active_calls.get(call_id, {}).get("status") != "rejected":
+            _safe_set_status(call_id, "ended")
+
+
+@app.websocket("/ws/agent/{call_id}")
+async def ws_agent(websocket: WebSocket, call_id: str):
+    await websocket.accept()
+
+    call = active_calls.setdefault(
+        call_id,
+        {
+            "customer_id": None,
+            "status": "ringing",
+            "agent_ws": None,
+            "client_ws": None,
+        },
+    )
+    call["agent_ws"] = websocket
+
+    # Send ringing event to client when agent connects.
+    client_ws = call.get("client_ws")
+    if client_ws is not None:
+        try:
+            await client_ws.send_text(json.dumps({"type": "ringing"}))
+        except Exception:
+            pass
+
+    def _get_client_ws():
+        return active_calls.get(call_id, {}).get("client_ws")
+
+    try:
+        await relay_messages(websocket, _get_client_ws, call_id, side="agent")
+    finally:
+        existing = active_calls.get(call_id)
+        if existing is not None and existing.get("agent_ws") is websocket:
+            existing["agent_ws"] = None
+
+
+@app.websocket("/ws/client/{call_id}")
+async def ws_client(websocket: WebSocket, call_id: str):
+    await websocket.accept()
+
+    call = active_calls.setdefault(
+        call_id,
+        {
+            "customer_id": None,
+            "status": "ringing",
+            "agent_ws": None,
+            "client_ws": None,
+        },
+    )
+    call["client_ws"] = websocket
+
+    def _get_agent_ws():
+        return active_calls.get(call_id, {}).get("agent_ws")
+
+    try:
+        await relay_messages(websocket, _get_agent_ws, call_id, side="client")
+    finally:
+        existing = active_calls.get(call_id)
+        if existing is not None and existing.get("client_ws") is websocket:
+            existing["client_ws"] = None
 
 
 def _fetch_all(sql: str, params: tuple[Any, ...] | None = None) -> list[dict[str, Any]]:
@@ -106,9 +217,16 @@ class CallInitiateRequest(_BaseModel):
 
 class CallInitiateResponse(_BaseModel):
     session_id: str
+    call_id: str
     customer_id: int
     status: str
     customer_name: Optional[str] = None
+
+
+class CallStatusResponse(_BaseModel):
+    call_id: str
+    status: str
+    customer_id: Optional[int] = None
 
 
 # -------------------------
@@ -130,7 +248,7 @@ async def api_get_clients() -> list[ClientSummary]:
                     status_code=500, detail=f"DB error: {info['error']}"
                 )
             continue
-        
+
         # Calculer le profil
         profile = await run_in_threadpool(classify_client_profile, info)
 
@@ -254,13 +372,57 @@ async def api_initiate_call(
         raise HTTPException(status_code=404, detail="Customer not found")
 
     session_id = str(uuid.uuid4())
+    call_id = str(uuid.uuid4())
+
+    active_calls[call_id] = {
+        "customer_id": payload.customer_id,
+        "status": "ringing",
+        "agent_ws": None,
+        "client_ws": None,
+    }
 
     # TODO Week 2 — start VoiceAgent session via WebRTC/WebSocket
     return CallInitiateResponse(
         session_id=session_id,
+        call_id=call_id,
         customer_id=payload.customer_id,
         status="initiated",
         customer_name=info.get("customer_name"),
+    )
+
+
+@app.get("/api/call/{call_id}/status", response_model=CallStatusResponse)
+async def api_get_call_status(call_id: str) -> CallStatusResponse:
+    call = active_calls.get(call_id)
+    if call is None:
+        raise HTTPException(status_code=404, detail="Call not found")
+
+    return CallStatusResponse(
+        call_id=call_id,
+        status=call.get("status", "unknown"),
+        customer_id=call.get("customer_id"),
+    )
+
+
+@app.post("/api/call/{call_id}/reject", response_model=CallStatusResponse)
+async def api_reject_call(call_id: str) -> CallStatusResponse:
+    call = active_calls.get(call_id)
+    if call is None:
+        raise HTTPException(status_code=404, detail="Call not found")
+
+    call["status"] = "rejected"
+
+    agent_ws = call.get("agent_ws")
+    if agent_ws is not None:
+        try:
+            await agent_ws.send_text(json.dumps({"type": "call_rejected"}))
+        except Exception:
+            pass
+
+    return CallStatusResponse(
+        call_id=call_id,
+        status=call.get("status", "rejected"),
+        customer_id=call.get("customer_id"),
     )
 
 
