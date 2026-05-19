@@ -10,6 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from psycopg2.extras import RealDictCursor
 from starlette.concurrency import run_in_threadpool
 
+from api.voice_agent_ws import WebSocketVoiceAgent
+
 from db.database import get_connection
 from db.tools import get_client_info
 from llm.langgraph_agent import classify_client_profile
@@ -32,6 +34,10 @@ app.add_middleware(
 # value: dict with agent_ws, client_ws, customer_id, status
 active_calls: dict[str, dict] = {}
 active_calls_lock = asyncio.Lock()
+
+# Active voice agent sessions
+# key: call_id, value: WebSocketVoiceAgent instance
+agent_sessions: dict[str, WebSocketVoiceAgent] = {}
 
 
 def _safe_set_status(call_id: str, status: str) -> None:
@@ -133,6 +139,120 @@ async def ws_client(websocket: WebSocket, call_id: str):
         existing = active_calls.get(call_id)
         if existing is not None and existing.get("client_ws") is websocket:
             existing["client_ws"] = None
+
+
+@app.websocket("/ws/audio/{call_id}")
+async def audio_stream(websocket: WebSocket, call_id: str):
+    """Audio WebSocket for VoiceAgent integration.
+
+    Protocol:
+    - Client sends: binary audio chunks (PCM 16kHz 16bit mono)
+    - Client sends: JSON {"type": "start"} to initiate agent
+    - Client sends: JSON {"type": "stop"} to end call
+    - Server sends: binary audio chunks (WAV TTS response)
+    - Server sends: JSON {"type": "transcript", "role": "client"|"agent", "text": "..."}
+    """
+
+    await websocket.accept()
+
+    call_info = active_calls.get(call_id)
+    if not call_info:
+        await websocket.send_json({"type": "error", "message": "Call not found"})
+        await websocket.close()
+        return
+
+    customer_id = call_info.get("customer_id")
+    if customer_id is None:
+        await websocket.send_json(
+            {"type": "error", "message": "Missing customer_id for call"}
+        )
+        await websocket.close()
+        return
+    agent: WebSocketVoiceAgent | None = None
+
+    async def send_audio(audio_bytes: bytes) -> None:
+        """Send TTS audio back to client browser."""
+
+        try:
+            await websocket.send_bytes(audio_bytes)
+        except Exception:
+            pass
+
+    async def send_transcript(event: dict) -> None:
+        """Send transcript events to client (and optionally to agent dashboard)."""
+
+        try:
+            payload = {
+                "type": "transcript",
+                "role": "agent" if event.get("type") == "agent_speech" else "client",
+                "text": event.get("text", ""),
+            }
+            await websocket.send_json(payload)
+
+            # Also relay to agent dashboard WebSocket if connected.
+            agent_ws = active_calls.get(call_id, {}).get("agent_ws")
+            if agent_ws:
+                try:
+                    await agent_ws.send_json(payload)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    try:
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+
+            # JSON control message
+            if message.get("text") is not None:
+                data = json.loads(message["text"])
+
+                if data.get("type") == "start":
+                    # Initialize VoiceAgent for this call
+                    if call_id not in agent_sessions:
+                        agent = WebSocketVoiceAgent(
+                            customer_id=int(customer_id),
+                            send_audio_callback=send_audio,
+                            send_transcript_callback=send_transcript,
+                        )
+                        agent_sessions[call_id] = agent
+
+                        # Start agent in background thread
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(None, agent.start_ws)
+
+                        active_calls[call_id]["status"] = "in_call"
+                    else:
+                        agent = agent_sessions[call_id]
+
+                elif data.get("type") == "stop":
+                    # End call - cleanup
+                    if call_id in agent_sessions:
+                        agent_sessions[call_id].shutdown()
+                        del agent_sessions[call_id]
+                    active_calls[call_id]["status"] = "ended"
+                    break
+
+            # Binary audio chunk from client microphone
+            elif message.get("bytes") is not None:
+                pcm_data = message["bytes"]
+                if agent and pcm_data:
+                    await agent.process_audio_chunk(pcm_data)
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        # Cleanup on disconnect
+        if call_id in agent_sessions:
+            try:
+                agent_sessions[call_id].shutdown()
+            except Exception:
+                pass
+            del agent_sessions[call_id]
+        if call_id in active_calls:
+            active_calls[call_id]["status"] = "ended"
 
 
 def _fetch_all(sql: str, params: tuple[Any, ...] | None = None) -> list[dict[str, Any]]:
