@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import os
+import wave
 from typing import Awaitable, Callable
 
 import numpy as np
@@ -33,10 +35,12 @@ class WebSocketVoiceAgent(VoiceAgent):
         customer_id: int,
         send_audio_callback: Callable[[bytes], Awaitable[None]],
         send_transcript_callback: Callable[[dict], Awaitable[None]],
+        on_shutdown_callback: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         # Store callbacks BEFORE super().__init__() because VoiceAgent methods may speak.
         self._send_audio = send_audio_callback
         self._send_transcript = send_transcript_callback
+        self._on_shutdown = on_shutdown_callback
 
         # Capture the loop used by the websocket connection.
         try:
@@ -49,6 +53,10 @@ class WebSocketVoiceAgent(VoiceAgent):
 
         super().__init__()
         self._customer_id = int(customer_id)
+
+        # Track last TTS chunk so we can delay hangup long enough for playback.
+        self._last_tts_duration_s: float = 0.0
+        self._last_tts_send_future = None
 
         # --- Replace microphone STT with StreamingWhisper (no microphone) ---
         # We reuse the project's exact VAD segmentation behavior, but we do NOT
@@ -183,7 +191,27 @@ class WebSocketVoiceAgent(VoiceAgent):
 
         audio_bytes = self._tts_to_bytes(cleaned)
         if audio_bytes:
-            asyncio.run_coroutine_threadsafe(self._send_audio(audio_bytes), self._loop)
+            self._last_tts_duration_s = self._wav_duration_seconds(audio_bytes)
+            self._last_tts_send_future = asyncio.run_coroutine_threadsafe(
+                self._send_audio(audio_bytes), self._loop
+            )
+
+    @staticmethod
+    def _wav_duration_seconds(wav_bytes: bytes) -> float:
+        """Best-effort WAV duration estimation to delay hangup for playback."""
+
+        if not wav_bytes:
+            return 0.0
+
+        try:
+            with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+                frames = int(wf.getnframes() or 0)
+                rate = int(wf.getframerate() or 0)
+            if frames <= 0 or rate <= 0:
+                return 0.0
+            return float(frames) / float(rate)
+        except Exception:
+            return 0.0
 
     def _tts_to_bytes(self, text: str) -> bytes | None:
         """Run Piper TTS and return WAV bytes instead of playing locally."""
@@ -231,11 +259,46 @@ class WebSocketVoiceAgent(VoiceAgent):
         await loop.run_in_executor(None, self._ws_stt.process_chunk, audio_float32)
 
     def shutdown(self) -> None:
+        """Override: notify the WebSocket layer that the agent wants to hang up."""
+
+        from main import _log
+
+        if self._shutdown_event.is_set():
+            return
+
+        _log("[WS-AGENT] Shutdown triggered — notifying WebSocket")
+
         try:
             self._ws_stt.stop_stream()
         except Exception:
             pass
+
+        # Parent shutdown: sets _shutdown_event and writes summary.
         super().shutdown()
+
+        if self._on_shutdown:
+
+            async def _notify_when_safe_to_hangup() -> None:
+                # 1) Ensure the last TTS bytes were sent (server-side)
+                try:
+                    fut = getattr(self, "_last_tts_send_future", None)
+                    if fut is not None:
+                        await asyncio.wrap_future(fut)
+                except Exception:
+                    pass
+
+                # 2) Give the browser time to play the WAV before closing.
+                try:
+                    delay = float(getattr(self, "_last_tts_duration_s", 0.0))
+                except Exception:
+                    delay = 0.0
+                delay = max(0.0, min(delay + 0.15, 20.0))
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+                await self._on_shutdown()
+
+            asyncio.run_coroutine_threadsafe(_notify_when_safe_to_hangup(), self._loop)
 
     # Override STT pause/resume (no-op since no microphone)
     def _pause_stt(self) -> None:

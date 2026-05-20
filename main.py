@@ -984,6 +984,46 @@ class VoiceAgent:
             run_negotiation_graph,
         )
 
+        # Guard: transition phrases after a claim — keep negotiation on track
+        # (avoid routing to RAG via intent="question" when client just wants to resume).
+        RESUME_NEGO_PATTERNS = [
+            "revenons",
+            "retour",
+            "reprendre",
+            "continuer",
+            "suite",
+            "négociation",
+            "negociation",
+            "on continue",
+            "on reprend",
+        ]
+        user_lower = (user_text or "").lower()
+        if (
+            self._negotiation_step == "await_confirmation"
+            and self._proposed_amount > 0
+            and any(p in user_lower for p in RESUME_NEGO_PATTERNS)
+        ):
+            recap_msg = (
+                "Bien sûr. Pour rappel, notre proposition est : "
+                f"{self._proposed_installments} mensualité(s) "
+                f"de {self._proposed_amount} DT, "
+                f"première échéance le {self._proposed_date}. "
+                "Acceptez-vous ce plan ?"
+            )
+            self._stt.pause()
+            try:
+                self.speak(recap_msg)
+            finally:
+                self._stt.resume()
+            self._log_call_event(
+                transcript=user_text,
+                intent="negotiation_resume",
+                outcome="await_confirmation",
+                agent_decision=recap_msg,
+                turn_number=turn_number,
+            )
+            return
+
         # Claim detection BEFORE any intent logic
         claim_keywords = [
             "réclamation",
@@ -998,7 +1038,6 @@ class VoiceAgent:
             "décalage",
             "restructuration",
         ]
-        user_lower = (user_text or "").lower()
         if any(kw in user_lower for kw in claim_keywords):
             self._claim_active = True
             self._claim_step = "await_subject"
@@ -1474,6 +1513,7 @@ class VoiceAgent:
         from db.tools import create_claim
 
         client = self._client_info or {}
+        claim_transcript = self._claim_body
         try:
             result = create_claim(
                 customer_id=self._customer_id,
@@ -1489,20 +1529,52 @@ class VoiceAgent:
                     f"Votre réclamation a bien été enregistrée "
                     f"sous le numéro {claim_id}. "
                     "Notre équipe vous contactera dans les plus brefs délais. "
-                    "Y a-t-il autre chose que je puisse faire pour vous ?"
                 )
+
+                # If a negotiation was active and we already have a proposed plan,
+                # resume directly with a recap and request confirmation.
+                if self._negotiation_active and self._proposed_amount > 0:
+                    msg += (
+                        "Revenons à notre discussion : "
+                        f"vous proposiez {self._proposed_installments} mensualité(s) "
+                        f"de {self._proposed_amount} DT, "
+                        f"première échéance le {self._proposed_date}. "
+                        "Confirmez-vous cet engagement ?"
+                    )
+                    self._negotiation_step = "await_confirmation"
+                else:
+                    msg += "Y a-t-il autre chose que je puisse faire pour vous ?"
                 outcome = "claim_saved"
             else:
                 msg = (
                     "Votre réclamation a été notée. "
                     "Notre équipe va traiter votre demande rapidement."
                 )
+
+                if self._negotiation_active and self._proposed_amount > 0:
+                    msg += (
+                        " Revenons à notre plan : "
+                        f"{self._proposed_installments} mensualité(s) "
+                        f"de {self._proposed_amount} DT, "
+                        f"première échéance le {self._proposed_date}. "
+                        "Confirmez-vous ?"
+                    )
+                    self._negotiation_step = "await_confirmation"
                 outcome = "claim_save_failed"
         except Exception as exc:
             _log(f"[CLAIM] save failed: {exc}")
             msg = (
                 "Votre réclamation a été notée. Notre équipe va traiter votre demande."
             )
+            if self._negotiation_active and self._proposed_amount > 0:
+                msg += (
+                    " Revenons à notre plan : "
+                    f"{self._proposed_installments} mensualité(s) "
+                    f"de {self._proposed_amount} DT, "
+                    f"première échéance le {self._proposed_date}. "
+                    "Confirmez-vous ?"
+                )
+                self._negotiation_step = "await_confirmation"
             outcome = "claim_exception"
 
         self._stt.pause()
@@ -1513,9 +1585,11 @@ class VoiceAgent:
 
         self._claim_active = False
         self._claim_step = ""
+        self._claim_subject = ""
+        self._claim_body = ""
 
         self._log_call_event(
-            transcript=self._claim_body,
+            transcript=claim_transcript,
             intent="claim_save",
             outcome=outcome,
             agent_decision=msg,

@@ -170,6 +170,9 @@ async def audio_stream(websocket: WebSocket, call_id: str):
         return
     agent: WebSocketVoiceAgent | None = None
 
+    # Event set when the agent requests shutdown (hang up).
+    agent_shutdown_event = asyncio.Event()
+
     async def send_audio(audio_bytes: bytes) -> None:
         """Send TTS audio back to client browser."""
 
@@ -199,9 +202,62 @@ async def audio_stream(websocket: WebSocket, call_id: str):
         except Exception:
             pass
 
+    async def on_agent_shutdown() -> None:
+        """Called by VoiceAgent when it wants to hang up."""
+
+        from main import _log
+
+        _log("[WS-AUDIO] Agent requested shutdown — closing WebSocket")
+
+        # Notify Angular client
+        try:
+            await websocket.send_json({"type": "call_ended"})
+        except Exception:
+            pass
+
+        # Notify agent dashboard
+        agent_ws = active_calls.get(call_id, {}).get("agent_ws")
+        if agent_ws:
+            try:
+                await agent_ws.send_json({"type": "call_ended"})
+            except Exception:
+                pass
+
+        # Notify signaling channel (phone emulator)
+        client_ws = active_calls.get(call_id, {}).get("client_ws")
+        if client_ws:
+            try:
+                await client_ws.send_text(json.dumps({"type": "call_ended"}))
+            except Exception:
+                pass
+
+        active_calls[call_id]["status"] = "ended"
+        agent_shutdown_event.set()
+
     try:
         while True:
-            message = await websocket.receive()
+            receive_task = asyncio.create_task(websocket.receive())
+            shutdown_task = asyncio.create_task(agent_shutdown_event.wait())
+
+            done, pending = await asyncio.wait(
+                [receive_task, shutdown_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for task in pending:
+                task.cancel()
+
+            if shutdown_task in done:
+                break
+
+            if receive_task not in done:
+                continue
+
+            try:
+                message = receive_task.result()
+            except Exception:
+                break
+
             if message.get("type") == "websocket.disconnect":
                 break
 
@@ -216,6 +272,7 @@ async def audio_stream(websocket: WebSocket, call_id: str):
                             customer_id=int(customer_id),
                             send_audio_callback=send_audio,
                             send_transcript_callback=send_transcript,
+                            on_shutdown_callback=on_agent_shutdown,
                         )
                         agent_sessions[call_id] = agent
 
@@ -253,6 +310,11 @@ async def audio_stream(websocket: WebSocket, call_id: str):
             del agent_sessions[call_id]
         if call_id in active_calls:
             active_calls[call_id]["status"] = "ended"
+
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 def _fetch_all(sql: str, params: tuple[Any, ...] | None = None) -> list[dict[str, Any]]:
