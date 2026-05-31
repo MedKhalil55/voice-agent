@@ -415,40 +415,45 @@ class CallStatusResponse(_BaseModel):
 # Endpoints
 # -------------------------
 
-
 @app.get("/api/clients", response_model=list[ClientSummary])
 async def api_get_clients() -> list[ClientSummary]:
-    customer_ids = [1001, 1002, 1003]
+    try:
+        rows = await run_in_threadpool(
+            _fetch_all,
+            """
+            SELECT DISTINCT c.customer_id_extern as customer_id
+            FROM acm_customer c
+            JOIN acm_collection col ON c.customer_id_extern = col.customer_id_extern
+            WHERE col.acm_enabled = TRUE
+            ORDER BY c.customer_id_extern
+            """,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
 
     results: list[ClientSummary] = []
-    for customer_id in customer_ids:
-        info = await run_in_threadpool(get_client_info, customer_id)
-
-        if not info.get("found"):
-            if "error" in info:
-                raise HTTPException(
-                    status_code=500, detail=f"DB error: {info['error']}"
+    for row in rows:
+        customer_id = row["customer_id"]
+        try:
+            info = await run_in_threadpool(get_client_info, customer_id)
+            if not info.get("found"):
+                continue
+            profile = await run_in_threadpool(classify_client_profile, info)
+            results.append(
+                ClientSummary(
+                    customer_id=customer_id,
+                    customer_name=info.get("customer_name"),
+                    unpaid_amount=float(info.get("unpaid_amount") or 0),
+                    late_days=int(info.get("late_days") or 0),
+                    statut_workflow=info.get("statut_workflow"),
+                    telephone_1=info.get("telephone_1"),
+                    email=info.get("email"),
+                    profile_type=profile.get("profile"),
                 )
-            continue
-
-        # Calculer le profil
-        profile = await run_in_threadpool(classify_client_profile, info)
-
-        results.append(
-            ClientSummary(
-                customer_id=customer_id,
-                customer_name=info.get("customer_name"),
-                unpaid_amount=info.get("unpaid_amount"),
-                late_days=info.get("late_days"),
-                statut_workflow=info.get("statut_workflow"),
-                telephone_1=info.get("telephone_1"),
-                email=info.get("email"),
-                profile_type=profile.get("profile"),  # ← CONTENTIEUX/FIDELE/DIFFICILE
             )
-        )
-
+        except Exception:
+            continue
     return results
-
 
 @app.get("/api/calls", response_model=list[CallLogEntry])
 async def api_get_calls(

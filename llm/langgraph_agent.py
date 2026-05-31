@@ -804,6 +804,79 @@ def extract_payment_date_from_transcript(transcript: str) -> str | None:
 
     normalized = _normalize_french_text(source)
 
+    # Convert French day words to digits before regex parsing.
+    # Why: ASR commonly returns "le huit" / "le quinze" (words, not digits).
+    DAY_WORDS: dict[str, int] = {
+        "premier": 1,
+        "premiere": 1,
+        "deux": 2,
+        "trois": 3,
+        "quatre": 4,
+        "cinq": 5,
+        "six": 6,
+        "sept": 7,
+        "huit": 8,
+        "neuf": 9,
+        "dix": 10,
+        "onze": 11,
+        "douze": 12,
+        "treize": 13,
+        "quatorze": 14,
+        "quinze": 15,
+        "seize": 16,
+        "dix-sept": 17,
+        "dix sept": 17,
+        "dix-huit": 18,
+        "dix huit": 18,
+        "dix-neuf": 19,
+        "dix neuf": 19,
+        "vingt": 20,
+        "vingt et un": 21,
+        "vingt-et-un": 21,
+        "vingt-deux": 22,
+        "vingt deux": 22,
+        "vingt-trois": 23,
+        "vingt trois": 23,
+        "vingt-quatre": 24,
+        "vingt quatre": 24,
+        "vingt-cinq": 25,
+        "vingt cinq": 25,
+        "vingt-six": 26,
+        "vingt six": 26,
+        "vingt-sept": 27,
+        "vingt sept": 27,
+        "vingt-huit": 28,
+        "vingt huit": 28,
+        "vingt-neuf": 29,
+        "vingt neuf": 29,
+        "trente": 30,
+        "trente et un": 31,
+        "trente-et-un": 31,
+    }
+
+    for word, num in sorted(DAY_WORDS.items(), key=lambda item: -len(item[0])):
+        # "le huit" -> "le 8"
+        normalized = re.sub(
+            rf"\ble\s+{re.escape(word)}\b",
+            f"le {num}",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        # "huit du mois" -> "8 du mois"
+        normalized = re.sub(
+            rf"\b{re.escape(word)}\s+du\s+mois\b",
+            f"{num} du mois",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        # Generic fallback: "huit" -> "8" (useful for "dans quinze jours", etc.)
+        normalized = re.sub(
+            rf"\b{re.escape(word)}\b",
+            f"{num}",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+
     # dans 15 jours
     match = re.search(r"\bdans\s+(\d{1,3})\s+jours?\b", normalized)
     if match:
@@ -851,6 +924,20 @@ def extract_payment_date_from_transcript(transcript: str) -> str | None:
             parsed = _build_date(day_value, month_value, int(year_raw))
         else:
             parsed = _future_or_current(day_value, month_value)
+        if parsed is not None:
+            return parsed.isoformat()
+
+    # 15 du mois
+    match = re.search(r"\b(\d{1,2})\s+du\s+mois\b", normalized)
+    if match:
+        day_value = int(match.group(1))
+        if today.day <= day_value:
+            parsed = _build_date(day_value, today.month, today.year)
+        else:
+            if today.month == 12:
+                parsed = _build_date(day_value, 1, today.year + 1)
+            else:
+                parsed = _build_date(day_value, today.month + 1, today.year)
         if parsed is not None:
             return parsed.isoformat()
 
@@ -1088,11 +1175,16 @@ def _accept_node(state: NegotiationState) -> dict:
     if not current_date:
         current_date = first_date
 
-    if negotiation_step != "await_final_confirmation" or date_changed:
+    # Single-confirmation flow:
+    # - Skip await_final_confirmation entirely.
+    # - Save directly when client accepts at await_confirmation.
+    # - ONLY add one extra recap if the client changes the date during
+    #   await_final_confirmation (edge case: last-moment date change).
+    if negotiation_step == "await_final_confirmation" and date_changed:
         recap = (
-            f"Pour confirmer : vous vous engagez à payer {inst} "
-            f"mensualité(s) de {amount} DT, première échéance le "
-            f"{current_date}. C'est bien votre accord ?"
+            "Pour confirmer avec la nouvelle date : "
+            f"{inst} mensualité(s) de {amount} DT, "
+            f"première échéance le {current_date}. C'est bien votre accord ?"
         )
         return {
             "action": "speak",
@@ -1129,6 +1221,22 @@ def _counter_node(state: NegotiationState) -> dict:
     min_amount = round((unpaid / max_inst) * 0.8, 2) if max_inst > 0 else 0.0
 
     user_text = state.get("user_text", "") or ""
+
+    prev_installments = int(state.get("proposed_installments") or 0)
+    prev_amount = float(state.get("proposed_amount") or 0.0)
+    prev_date = str(state.get("proposed_date") or "").strip()
+
+    extracted_date_early = extract_payment_date_from_transcript(user_text)
+    normalized_for_detection = _normalize_french_text(user_text)
+    mentions_installments = bool(
+        re.search(
+            r"\bmensualit|\bfois\b|\ben\s+(\d+|une|un|deux|trois|quatre|cinq|six)\b",
+            normalized_for_detection,
+        )
+    )
+    mentions_amount = bool(
+        re.search(r"\b(dt|dinar|dinars|tnd|montant)\b", normalized_for_detection)
+    )
 
     def _extract_json(raw: str) -> dict:
         try:
@@ -1216,6 +1324,44 @@ def _counter_node(state: NegotiationState) -> dict:
         valid_installments[-1] if valid_installments else None
     )
 
+    # Priority case: client only wants to change the payment date.
+    # This avoids LLM mis-reading "le 25" as "1 mensualité" and breaking the plan.
+    if (
+        extracted_date_early
+        and forced_installments is None
+        and not mentions_installments
+        and not mentions_amount
+    ):
+        inst_candidate = prev_installments if prev_installments > 0 else max_inst
+        amount_candidate = prev_amount if prev_amount > 0.0 else suggested
+        date_candidate = extracted_date_early
+
+        is_valid_installments = 1 <= int(inst_candidate) <= max_inst
+        is_valid_amount = float(amount_candidate) >= min_amount
+        if is_valid_installments and is_valid_amount:
+            if date_candidate and date_candidate != first_date:
+                counter_ok_msg = (
+                    f"D'accord, je note votre proposition de {int(inst_candidate)} "
+                    f"mensualité(s) de {round(float(amount_candidate), 2)} DT, "
+                    f"première échéance le {date_candidate}. "
+                    "Confirmez-vous cet engagement ?"
+                )
+            else:
+                counter_ok_msg = (
+                    f"D'accord, je note votre proposition de {int(inst_candidate)} "
+                    f"mensualité(s) de {round(float(amount_candidate), 2)} DT. "
+                    "Confirmez-vous cet engagement ?"
+                )
+            return {
+                "action": "speak",
+                "response_text": counter_ok_msg,
+                "next_step": "await_confirmation",
+                "new_installments": int(inst_candidate),
+                "new_amount": round(float(amount_candidate), 2),
+                "new_date": date_candidate,
+                "new_refusals": int(state.get("negotiation_refusals") or 0),
+            }
+
     counter_prompt = (
         "Extrait le nombre de mensualités ou le montant proposé par le client. "
         'Réponds uniquement en JSON: {"installments": int|null, "amount": float|null}.'
@@ -1234,10 +1380,6 @@ def _counter_node(state: NegotiationState) -> dict:
 
     if forced_installments is not None:
         inst_value = forced_installments
-
-    prev_installments = int(state.get("proposed_installments") or 0)
-    prev_amount = float(state.get("proposed_amount") or 0.0)
-    prev_date = str(state.get("proposed_date") or "").strip()
 
     inst_explicit = inst_value is not None
     try:
@@ -1263,7 +1405,7 @@ def _counter_node(state: NegotiationState) -> dict:
                 else round(unpaid / max(inst_candidate, 1), 2)
             )
 
-    extracted_date = extract_payment_date_from_transcript(user_text)
+    extracted_date = extracted_date_early
     if extracted_date and not inst_explicit and not amount_explicit:
         inst_candidate = prev_installments if prev_installments > 0 else max_inst
         amount_candidate = prev_amount if prev_amount > 0.0 else suggested
@@ -1274,11 +1416,19 @@ def _counter_node(state: NegotiationState) -> dict:
     is_valid_amount = float(amount_candidate) >= min_amount
 
     if is_valid_installments and is_valid_amount:
-        counter_ok_msg = (
-            f"D'accord, je note votre proposition de {int(inst_candidate)} "
-            f"mensualité(s) de {round(float(amount_candidate), 2)} DT. "
-            "Confirmez-vous cet engagement ?"
-        )
+        if date_candidate and date_candidate != first_date:
+            counter_ok_msg = (
+                f"D'accord, je note votre proposition de {int(inst_candidate)} "
+                f"mensualité(s) de {round(float(amount_candidate), 2)} DT, "
+                f"première échéance le {date_candidate}. "
+                "Confirmez-vous cet engagement ?"
+            )
+        else:
+            counter_ok_msg = (
+                f"D'accord, je note votre proposition de {int(inst_candidate)} "
+                f"mensualité(s) de {round(float(amount_candidate), 2)} DT. "
+                "Confirmez-vous cet engagement ?"
+            )
         return {
             "action": "speak",
             "response_text": counter_ok_msg,
@@ -1307,6 +1457,36 @@ def _counter_node(state: NegotiationState) -> dict:
 
 
 def _refuse_node(state: NegotiationState) -> dict:
+    user_text = state.get("user_text", "") or ""
+    negotiation_step = str(state.get("negotiation_step") or "")
+
+    # Guard: if we asked for an alternative date and the client provides one,
+    # this is not a refusal escalation; keep the plan and ask for confirmation.
+    if negotiation_step == "propose_alternative_date":
+        extracted_date = extract_payment_date_from_transcript(user_text)
+        if extracted_date:
+            profile = state.get("profile") or {}
+            inst = int(state.get("proposed_installments") or 0) or int(
+                profile.get("max_installments") or 3
+            )
+            amount = float(state.get("proposed_amount") or 0.0) or float(
+                profile.get("suggested_amount") or 0.0
+            )
+            msg = (
+                f"D'accord. Vous paierez {inst} mensualité(s) de {amount} DT, "
+                f"première échéance le {extracted_date}. "
+                "Confirmez-vous cet engagement ?"
+            )
+            return {
+                "action": "speak",
+                "response_text": msg,
+                "next_step": "await_confirmation",
+                "new_installments": inst,
+                "new_amount": round(float(amount), 2),
+                "new_date": extracted_date,
+                "new_refusals": int(state.get("negotiation_refusals") or 0),
+            }
+
     profile = state.get("profile") or {}
     client = state.get("client_info") or {}
 

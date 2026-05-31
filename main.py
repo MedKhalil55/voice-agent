@@ -1541,7 +1541,7 @@ class VoiceAgent:
                         f"première échéance le {self._proposed_date}. "
                         "Confirmez-vous cet engagement ?"
                     )
-                    self._negotiation_step = "await_confirmation"
+                    self._negotiation_step = "await_final_confirmation"
                 else:
                     msg += "Y a-t-il autre chose que je puisse faire pour vous ?"
                 outcome = "claim_saved"
@@ -1559,7 +1559,7 @@ class VoiceAgent:
                         f"première échéance le {self._proposed_date}. "
                         "Confirmez-vous ?"
                     )
-                    self._negotiation_step = "await_confirmation"
+                    self._negotiation_step = "await_final_confirmation"
                 outcome = "claim_save_failed"
         except Exception as exc:
             _log(f"[CLAIM] save failed: {exc}")
@@ -1574,7 +1574,7 @@ class VoiceAgent:
                     f"première échéance le {self._proposed_date}. "
                     "Confirmez-vous ?"
                 )
-                self._negotiation_step = "await_confirmation"
+                self._negotiation_step = "await_final_confirmation"
             outcome = "claim_exception"
 
         self._stt.pause()
