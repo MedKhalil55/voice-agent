@@ -365,6 +365,19 @@ class VoiceAgent:
         except Exception:
             pass
 
+        # Mark call as in-progress.
+        try:
+            from db.tools import set_call_status
+
+            set_call_status(
+                customer_id=self._customer_id,
+                status="IN_CALL",
+                session_id=self._session_id,
+                notes="Appel en cours",
+            )
+        except Exception as exc:
+            _log(f"[CALL_STATUS] set IN_CALL failed: {exc}")
+
         # Greeting personnalisé avec le nom
         civilite = "Monsieur"  # ou logique selon le nom
 
@@ -1387,6 +1400,22 @@ class VoiceAgent:
                 reason_raw=self._client_reason_raw,
             )
             if result.get("success") or result.get("ok"):
+                # Block calls until promised_date
+                try:
+                    from db.tools import set_call_status
+
+                    set_call_status(
+                        customer_id=self._customer_id,
+                        status="PROMISED",
+                        next_call_date=self._proposed_date,
+                        session_id=self._session_id,
+                        notes=(
+                            f"Promesse: {self._proposed_installments}x{self._proposed_amount}DT"
+                        ),
+                    )
+                except Exception as exc:
+                    _log(f"[CALL_STATUS] set PROMISED failed: {exc}")
+
                 self._negotiation_active = False
                 self._negotiation_step = "done"
                 confirmation = (
@@ -1673,6 +1702,68 @@ class VoiceAgent:
 
         if self._shutdown_event.is_set():
             return
+
+        # Persist call status based on negotiation outcome.
+        # This must never block shutdown.
+        try:
+            from db.tools import get_call_status, set_call_status
+            from datetime import date, timedelta
+
+            current_status = ""
+            try:
+                current_status = str(
+                    (get_call_status(self._customer_id) or {}).get("status") or ""
+                ).strip()
+            except Exception:
+                current_status = ""
+
+            # Never override a saved promise.
+            if current_status == "PROMISED":
+                pass
+            # Callback accepted (stage reached after 3 refusals).
+            elif self._negotiation_refusals == 3 and self._negotiation_step in (
+                "propose_rappel",
+                "done",
+            ):
+                set_call_status(
+                    customer_id=self._customer_id,
+                    status="CALLBACK",
+                    next_call_date=(date.today() + timedelta(days=15)).isoformat(),
+                    session_id=self._session_id,
+                    notes="Rappel demandé dans 15 jours",
+                )
+            elif self._negotiation_step == "done":
+                # Done without PROMISED (fallback) -> FREE
+                set_call_status(
+                    customer_id=self._customer_id,
+                    status="FREE",
+                    session_id=self._session_id,
+                    notes="Appel terminé — retour libre",
+                )
+            elif self._negotiation_refusals >= 4:
+                # Total refusal — block 7 days
+                set_call_status(
+                    customer_id=self._customer_id,
+                    status="REFUSED",
+                    next_call_date=(date.today() + timedelta(days=7)).isoformat(),
+                    session_id=self._session_id,
+                    notes="Refus total après 4 tentatives",
+                )
+            else:
+                # All other cases → FREE
+                # Covers:
+                # - Failed identity verification (not self._verified)
+                # - Wrong number / name confirmation = no
+                # - Call ended mid-negotiation
+                # - DOB failed 3 times
+                set_call_status(
+                    customer_id=self._customer_id,
+                    status="FREE",
+                    session_id=self._session_id,
+                    notes="Appel terminé — retour libre",
+                )
+        except Exception as exc:
+            _log(f"[CALL_STATUS] shutdown status update failed: {exc}")
 
         self._shutdown_event.set()
         try:

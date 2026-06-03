@@ -47,6 +47,23 @@ def _safe_set_status(call_id: str, status: str) -> None:
     call["status"] = status
 
 
+async def _free_call_status_db(customer_id: int, reason: str) -> None:
+    """Release call status in DB after reject or end."""
+    try:
+        from db.tools import set_call_status
+
+        await run_in_threadpool(
+            set_call_status,
+            customer_id,
+            "FREE",
+            None,
+            "",
+            reason,
+        )
+    except Exception:
+        pass
+
+
 def _update_status_from_message(call_id: str, message_text: str) -> None:
     try:
         payload = json.loads(message_text)
@@ -61,8 +78,16 @@ def _update_status_from_message(call_id: str, message_text: str) -> None:
         _safe_set_status(call_id, "accepted")
     elif msg_type == "call_rejected":
         _safe_set_status(call_id, "rejected")
+        customer_id = active_calls.get(call_id, {}).get("customer_id")
+        if customer_id:
+            asyncio.create_task(
+                _free_call_status_db(customer_id, "Appel rejeté depuis émulateur")
+            )
     elif msg_type == "call_ended":
         _safe_set_status(call_id, "ended")
+        customer_id = active_calls.get(call_id, {}).get("customer_id")
+        if customer_id:
+            asyncio.create_task(_free_call_status_db(customer_id, "Appel terminé"))
     elif msg_type == "ringing":
         _safe_set_status(call_id, "ringing")
 
@@ -76,8 +101,10 @@ async def relay_messages(sender: WebSocket, receiver_getter, call_id: str, side:
             if receiver:
                 await receiver.send_text(data)
     except WebSocketDisconnect:
-        # Don't overwrite an explicit reject status.
-        if active_calls.get(call_id, {}).get("status") != "rejected":
+        # ← MODIFIER : ne pas écraser "in_call" quand le dashboard se déconnecte
+        # Un refresh de page = déconnexion temporaire, pas fin d'appel
+        current = active_calls.get(call_id, {}).get("status", "")
+        if current not in ("rejected", "in_call", "accepted"):
             _safe_set_status(call_id, "ended")
 
 
@@ -85,6 +112,7 @@ async def relay_messages(sender: WebSocket, receiver_getter, call_id: str, side:
 async def ws_agent(websocket: WebSocket, call_id: str):
     await websocket.accept()
 
+    # Créer ou récupérer l'entrée existante
     call = active_calls.setdefault(
         call_id,
         {
@@ -92,13 +120,44 @@ async def ws_agent(websocket: WebSocket, call_id: str):
             "status": "ringing",
             "agent_ws": None,
             "client_ws": None,
+            "transcripts": [],
         },
     )
+
+    # ← Remplacer l'ancien agent_ws par le nouveau (reconnexion)
+    old_ws = call.get("agent_ws")
+    if old_ws is not None and old_ws is not websocket:
+        try:
+            await old_ws.close()
+        except Exception:
+            pass
+
     call["agent_ws"] = websocket
 
-    # Send ringing event to client when agent connects.
+    # ← Si appel en cours, envoyer l'état actuel au dashboard reconnecté
+    current_status = call.get("status", "ringing")
+    try:
+        await websocket.send_json(
+            {
+                "type": "call_status",
+                "status": current_status,
+                "call_id": call_id,
+            }
+        )
+    except Exception:
+        pass
+
+    # Replay past transcripts to the dashboard after reconnect.
+    past_transcripts = call.get("transcripts", [])
+    for transcript_msg in past_transcripts:
+        try:
+            await websocket.send_json(transcript_msg)
+        except Exception:
+            break
+
+    # Envoyer ringing au client si connecté
     client_ws = call.get("client_ws")
-    if client_ws is not None:
+    if client_ws is not None and current_status == "ringing":
         try:
             await client_ws.send_text(json.dumps({"type": "ringing"}))
         except Exception:
@@ -126,6 +185,7 @@ async def ws_client(websocket: WebSocket, call_id: str):
             "status": "ringing",
             "agent_ws": None,
             "client_ws": None,
+            "transcripts": [],
         },
     )
     call["client_ws"] = websocket
@@ -190,6 +250,9 @@ async def audio_stream(websocket: WebSocket, call_id: str):
                 "role": "agent" if event.get("type") == "agent_speech" else "client",
                 "text": event.get("text", ""),
             }
+            call_data = active_calls.get(call_id)
+            if call_data is not None:
+                call_data.setdefault("transcripts", []).append(payload)
             await websocket.send_json(payload)
 
             # Also relay to agent dashboard WebSocket if connected.
@@ -208,6 +271,8 @@ async def audio_stream(websocket: WebSocket, call_id: str):
         from main import _log
 
         _log("[WS-AUDIO] Agent requested shutdown — closing WebSocket")
+
+        await _free_call_status_db(customer_id, "Agent a raccroché")
 
         # Notify Angular client
         try:
@@ -301,15 +366,16 @@ async def audio_stream(websocket: WebSocket, call_id: str):
     except WebSocketDisconnect:
         pass
     finally:
-        # Cleanup on disconnect
-        if call_id in agent_sessions:
-            try:
-                agent_sessions[call_id].shutdown()
-            except Exception:
-                pass
-            del agent_sessions[call_id]
-        if call_id in active_calls:
-            active_calls[call_id]["status"] = "ended"
+        current_status = active_calls.get(call_id, {}).get("status", "ended")
+        is_real_end = current_status in ("ended", "rejected")
+
+        if is_real_end:
+            if call_id in agent_sessions:
+                try:
+                    agent_sessions[call_id].shutdown()
+                except Exception:
+                    pass
+                del agent_sessions[call_id]
 
         try:
             await websocket.close()
@@ -355,6 +421,12 @@ class ClientSummary(_BaseModel):
     telephone_1: Optional[str] = None
     email: Optional[str] = None
     profile_type: Optional[str] = None
+    call_status: Optional[str] = (
+        None  # FREE/PROMISED/REFUSED/CALLBACK/IN_CALL/BROKEN/KEPT
+    )
+    next_call_date: Optional[str] = None  # ISO date string
+    days_left: Optional[int] = None
+    can_call: Optional[bool] = True
 
 
 class CallLogEntry(_BaseModel):
@@ -415,6 +487,7 @@ class CallStatusResponse(_BaseModel):
 # Endpoints
 # -------------------------
 
+
 @app.get("/api/clients", response_model=list[ClientSummary])
 async def api_get_clients() -> list[ClientSummary]:
     try:
@@ -439,6 +512,9 @@ async def api_get_clients() -> list[ClientSummary]:
             if not info.get("found"):
                 continue
             profile = await run_in_threadpool(classify_client_profile, info)
+            from db.tools import get_call_status
+
+            cs = await run_in_threadpool(get_call_status, customer_id)
             results.append(
                 ClientSummary(
                     customer_id=customer_id,
@@ -449,11 +525,24 @@ async def api_get_clients() -> list[ClientSummary]:
                     telephone_1=info.get("telephone_1"),
                     email=info.get("email"),
                     profile_type=profile.get("profile"),
+                    call_status=cs.get("status", "FREE"),
+                    next_call_date=cs.get("next_call_date"),
+                    days_left=cs.get("days_left"),
+                    can_call=cs.get("can_call", True),
                 )
             )
         except Exception:
             continue
     return results
+
+
+@app.get("/api/call-status/{customer_id}")
+async def api_get_customer_call_status(customer_id: int):
+    from db.tools import get_call_status
+
+    result = await run_in_threadpool(get_call_status, customer_id)
+    return result
+
 
 @app.get("/api/calls", response_model=list[CallLogEntry])
 async def api_get_calls(
@@ -558,6 +647,22 @@ async def api_initiate_call(
             raise HTTPException(status_code=500, detail=f"DB error: {info['error']}")
         raise HTTPException(status_code=404, detail="Customer not found")
 
+    from db.tools import get_call_status
+
+    call_status_info = await run_in_threadpool(get_call_status, payload.customer_id)
+
+    if not call_status_info.get("can_call", True):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "blocked": True,
+                "status": call_status_info.get("status"),
+                "reason": call_status_info.get("reason"),
+                "next_call_date": call_status_info.get("next_call_date"),
+                "days_left": call_status_info.get("days_left"),
+            },
+        )
+
     session_id = str(uuid.uuid4())
     call_id = str(uuid.uuid4())
 
@@ -566,7 +671,23 @@ async def api_initiate_call(
         "status": "ringing",
         "agent_ws": None,
         "client_ws": None,
+        "transcripts": [],
     }
+
+    # Mark IN_CALL here (call is initiated) rather than in start_ws().
+    try:
+        from db.tools import set_call_status
+
+        await run_in_threadpool(
+            set_call_status,
+            payload.customer_id,
+            "IN_CALL",
+            None,
+            session_id,
+            "Appel initié",
+        )
+    except Exception:
+        pass
 
     # TODO Week 2 — start VoiceAgent session via WebRTC/WebSocket
     return CallInitiateResponse(
@@ -598,6 +719,10 @@ async def api_reject_call(call_id: str) -> CallStatusResponse:
         raise HTTPException(status_code=404, detail="Call not found")
 
     call["status"] = "rejected"
+
+    customer_id = call.get("customer_id")
+    if customer_id:
+        await _free_call_status_db(customer_id, "Appel rejeté depuis dashboard")
 
     agent_ws = call.get("agent_ws")
     if agent_ws is not None:

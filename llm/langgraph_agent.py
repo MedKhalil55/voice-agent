@@ -1155,7 +1155,7 @@ def _accept_node(state: NegotiationState) -> dict:
             "doit être régularisée. Bonne journée."
         )
         return {
-            "action": "speak",
+            "action": "hangup",
             "response_text": rappel_msg,
             "next_step": "done",
             "new_installments": int(state.get("proposed_installments") or 0),
