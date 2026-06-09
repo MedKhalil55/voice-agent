@@ -64,7 +64,7 @@ async def _free_call_status_db(customer_id: int, reason: str) -> None:
         pass
 
 
-def _update_status_from_message(call_id: str, message_text: str) -> None:
+async def _update_status_from_message_async(call_id: str, message_text: str) -> None:
     try:
         payload = json.loads(message_text)
     except Exception:
@@ -74,20 +74,22 @@ def _update_status_from_message(call_id: str, message_text: str) -> None:
         return
 
     msg_type = payload.get("type")
+
     if msg_type == "call_accepted":
         _safe_set_status(call_id, "accepted")
+
     elif msg_type == "call_rejected":
         _safe_set_status(call_id, "rejected")
         customer_id = active_calls.get(call_id, {}).get("customer_id")
         if customer_id:
-            asyncio.create_task(
-                _free_call_status_db(customer_id, "Appel rejeté depuis émulateur")
-            )
+            await _free_call_status_db(customer_id, "Appel rejeté depuis émulateur")
+
     elif msg_type == "call_ended":
         _safe_set_status(call_id, "ended")
         customer_id = active_calls.get(call_id, {}).get("customer_id")
-        if customer_id:
-            asyncio.create_task(_free_call_status_db(customer_id, "Appel terminé"))
+        if customer_id and call_id not in agent_sessions:
+            await _free_call_status_db(customer_id, "Appel terminé côté client")
+
     elif msg_type == "ringing":
         _safe_set_status(call_id, "ringing")
 
@@ -96,10 +98,11 @@ async def relay_messages(sender: WebSocket, receiver_getter, call_id: str, side:
     try:
         while True:
             data = await sender.receive_text()
-            _update_status_from_message(call_id, data)
+            await _update_status_from_message_async(call_id, data)
             receiver = receiver_getter()
             if receiver:
                 await receiver.send_text(data)
+
     except WebSocketDisconnect:
         # ← MODIFIER : ne pas écraser "in_call" quand le dashboard se déconnecte
         # Un refresh de page = déconnexion temporaire, pas fin d'appel
@@ -272,11 +275,13 @@ async def audio_stream(websocket: WebSocket, call_id: str):
 
         _log("[WS-AUDIO] Agent requested shutdown — closing WebSocket")
 
+        # Release DB call status — the agent hung up.
         await _free_call_status_db(customer_id, "Agent a raccroché")
 
         # Notify Angular client
         try:
             await websocket.send_json({"type": "call_ended"})
+
         except Exception:
             pass
 
@@ -355,7 +360,11 @@ async def audio_stream(websocket: WebSocket, call_id: str):
                         agent_sessions[call_id].shutdown()
                         del agent_sessions[call_id]
                     active_calls[call_id]["status"] = "ended"
+                    await _free_call_status_db(
+                        customer_id, "Appel arrêté par le client"
+                    )
                     break
+
 
             # Binary audio chunk from client microphone
             elif message.get("bytes") is not None:
@@ -736,6 +745,26 @@ async def api_reject_call(call_id: str) -> CallStatusResponse:
         status=call.get("status", "rejected"),
         customer_id=call.get("customer_id"),
     )
+
+
+@app.post("/api/mcp/tool")
+async def call_mcp_tool_endpoint(
+    tool_name: str = Body(..., embed=True),
+    arguments: dict = Body(..., embed=True),
+) -> dict:
+    """
+    HTTP proxy to MCP Server.
+    Allows Angular dashboard to call MCP tools directly.
+    Example: POST /api/mcp/tool {"tool_name": "get_client_info", "arguments": {"customer_id": 1001}}
+    """
+    from llm.mcp_client import ACMMCPClient
+
+    try:
+        mcp = ACMMCPClient.get_instance()
+        result = await run_in_threadpool(mcp.call_tool, tool_name, arguments)
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"MCP error: {exc}")
 
 
 if __name__ == "__main__":

@@ -2063,7 +2063,7 @@ def _real_create_claim(args: Dict) -> Dict:
 
 
 def _tool_executor_node(state: AgentState) -> AgentState:
-    """Execute tools listed in state.tool_calls."""
+    """Execute tools via MCP Server instead of direct db/tools.py calls."""
 
     tool_calls = state.get("tool_calls") or []
     if not tool_calls:
@@ -2072,69 +2072,62 @@ def _tool_executor_node(state: AgentState) -> AgentState:
             "tool_call_count": int(state.get("tool_call_count") or 0),
         }
 
-    tools = {
-        "get_client_info": _real_account_lookup,
-        "mock_account_lookup": _real_account_lookup,
-        "create_payment_promise": _real_payment_promise,
-        "mock_payment_plan": _real_payment_promise,
-        "log_call": _real_log_call,
-        "create_claim": _real_create_claim,
-        # Accept common aliases for compatibility.
-        "get_account_lookup": _real_account_lookup,
-        "get_payment_plan": _real_payment_promise,
-        "get_arrears": _real_account_lookup,
+    from llm.mcp_client import ACMMCPClient
+
+    mcp = ACMMCPClient.get_instance()
+
+    # Map tool aliases to canonical MCP tool names
+    TOOL_NAME_MAP = {
+        "get_client_info": "get_client_info",
+        "mock_account_lookup": "get_client_info",
+        "get_account_lookup": "get_client_info",
+        "get_arrears": "get_client_info",
+        "create_payment_promise": "create_payment_promise",
+        "mock_payment_plan": "create_payment_promise",
+        "get_payment_plan": "create_payment_promise",
+        "log_call": "log_call",
+        "create_claim": "create_claim",
+        "get_call_history": "get_call_history",
+        "get_call_status": "get_call_status",
     }
 
-    results: List[Dict] = []
+    results = []
     for call in tool_calls:
         name = call.get("name", "")
         args = call.get("args") or {}
-        tool_fn = tools.get(name)
 
-        if tool_fn is None:
-            normalized = str(name).strip().lower().replace("_", " ").replace("-", " ")
-            if (
-                "arrear" in normalized
-                or "outstanding" in normalized
-                or "solde" in normalized
-                or "client" in normalized
-                or "account" in normalized
-            ):
-                tool_fn = _real_account_lookup
-            elif (
-                "payment" in normalized
-                or "plan" in normalized
-                or "mensual" in normalized
-                or "echeancier" in normalized
-            ):
-                tool_fn = _real_payment_promise
+        # Resolve alias to canonical name
+        canonical_name = TOOL_NAME_MAP.get(name)
 
-        if tool_fn is None:
-            results.append(
-                {
-                    "tool": name,
-                    "ok": False,
-                    "error": "unknown_tool",
-                }
-            )
-            continue
+        if canonical_name is None:
+            # Try fuzzy matching for unknown tool names
+            name_lower = str(name).lower()
+            if any(k in name_lower for k in ["account", "client", "arrear", "solde"]):
+                canonical_name = "get_client_info"
+            elif any(
+                k in name_lower for k in ["payment", "promise", "plan", "mensual"]
+            ):
+                canonical_name = "create_payment_promise"
+            else:
+                results.append({"tool": name, "ok": False, "error": "unknown_tool"})
+                continue
 
         try:
-            results.append(tool_fn(args))
-        except Exception as exc:
-            results.append(
-                {
-                    "tool": name,
-                    "ok": False,
-                    "error": str(exc),
-                }
+            result = mcp.call_tool(canonical_name, args)
+            result["ok"] = bool(
+                result.get("found") or result.get("success") or result.get("ok")
             )
+            result.setdefault("tool", canonical_name)
+            results.append(result)
+        except Exception as exc:
+            results.append({"tool": canonical_name, "ok": False, "error": str(exc)})
 
     return {
         "tool_calls": [],
         "tool_results": results,
         "tool_call_count": int(state.get("tool_call_count") or 0) + 1,
     }
+
 
 
 def _speak_node(state: AgentState) -> AgentState:
