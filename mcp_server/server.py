@@ -169,6 +169,11 @@ def _serialize(result: object) -> list[TextContent]:
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     arguments = arguments or {}
+    print(
+        f"[MCP-SERVER] Tool appelé: {name} | args: {arguments}",
+        file=sys.stderr,
+        flush=True,
+    )
     try:
         if name == "get_client_info":
             result = get_client_info(int(arguments["customer_id"]))
@@ -216,9 +221,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         else:
             result = {"error": f"unknown_tool: {name}"}
 
+        print(
+            f"[MCP-SERVER] Tool terminé: {name} | result: {result}",
+            file=sys.stderr,
+            flush=True,
+        )
+
         return _serialize(result)
 
     except Exception as exc:  # noqa: BLE001
+        print(
+            f"[MCP-SERVER] Tool erreur: {name} | error: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
         return [TextContent(type="text", text=json.dumps({"error": str(exc)}))]
 
 

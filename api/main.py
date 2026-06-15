@@ -89,6 +89,7 @@ async def _update_status_from_message_async(call_id: str, message_text: str) -> 
             # Pas d'agent actif → appel terminé côté signaling uniquement
             # Vérifier avant d'écraser un résultat existant
             from db.tools import get_call_status
+
             current = await run_in_threadpool(get_call_status, customer_id)
             if current.get("status") not in ("PROMISED", "CALLBACK", "REFUSED", "KEPT"):
                 await _free_call_status_db(customer_id, "Appel terminé côté client")
@@ -109,6 +110,7 @@ async def relay_messages(sender: WebSocket, receiver_getter, call_id: str, side:
         current = active_calls.get(call_id, {}).get("status", "")
         if current not in ("rejected", "in_call", "accepted"):
             _safe_set_status(call_id, "ended")
+
 
 @app.websocket("/ws/agent/{call_id}")
 async def ws_agent(websocket: WebSocket, call_id: str):
@@ -269,6 +271,7 @@ async def audio_stream(websocket: WebSocket, call_id: str):
 
     async def on_agent_shutdown() -> None:
         from main import _log
+
         _log("[WS-AUDIO] Agent requested shutdown — closing WebSocket")
 
         # ← Vérifier le statut APRÈS que main.py ait fini son shutdown()
@@ -276,6 +279,7 @@ async def audio_stream(websocket: WebSocket, call_id: str):
         # on_agent_shutdown() est appelé APRÈS (voir _notify_when_safe_to_hangup)
         # donc on lit ce que main.py a écrit
         from db.tools import get_call_status
+
         current = await run_in_threadpool(get_call_status, customer_id)
         db_status = current.get("status", "FREE")
 
@@ -362,11 +366,18 @@ async def audio_stream(websocket: WebSocket, call_id: str):
                         del agent_sessions[call_id]
                     active_calls[call_id]["status"] = "ended"
                     from db.tools import get_call_status
-                    current = await run_in_threadpool(get_call_status, customer_id)
-                    if current.get("status") not in ("PROMISED", "CALLBACK", "REFUSED", "KEPT"):
-                        await _free_call_status_db(customer_id, "Appel arrêté par le client")
-                    break
 
+                    current = await run_in_threadpool(get_call_status, customer_id)
+                    if current.get("status") not in (
+                        "PROMISED",
+                        "CALLBACK",
+                        "REFUSED",
+                        "KEPT",
+                    ):
+                        await _free_call_status_db(
+                            customer_id, "Appel arrêté par le client"
+                        )
+                    break
 
             # Binary audio chunk from client microphone
             elif message.get("bytes") is not None:
@@ -748,6 +759,7 @@ async def api_reject_call(call_id: str) -> CallStatusResponse:
         customer_id=call.get("customer_id"),
     )
 
+
 @app.post("/api/mcp/tool")
 async def call_mcp_tool_endpoint(
     tool_name: str = Body(..., embed=True),
@@ -758,13 +770,18 @@ async def call_mcp_tool_endpoint(
     Allows Angular dashboard to call MCP tools directly.
     Example: POST /api/mcp/tool {"tool_name": "get_client_info", "arguments": {"customer_id": 1001}}
     """
+    from main import _log
+
+    _log(f"[MCP-HTTP] tool={tool_name} args={arguments}")
     from llm.mcp_client import ACMMCPClient
 
     try:
         mcp = ACMMCPClient.get_instance()
         result = await run_in_threadpool(mcp.call_tool, tool_name, arguments)
+        _log(f"[MCP-HTTP] tool={tool_name} result={result}")
         return result
     except Exception as exc:
+        _log(f"[MCP-HTTP] tool={tool_name} error={exc}")
         raise HTTPException(status_code=500, detail=f"MCP error: {exc}")
 
 

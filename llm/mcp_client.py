@@ -138,12 +138,15 @@ class ACMMCPClient:
             if text is not None:
                 try:
                     parsed = json.loads(text)
+                    print(f"[ACMMCPClient] tool_result({tool_name}) = {parsed}")
                     if isinstance(parsed, dict):
                         return parsed
                     return {"result": parsed}
                 except json.JSONDecodeError:
+                    print(f"[ACMMCPClient] tool_result({tool_name}) raw_text = {text}")
                     return {"result": text}
 
+        print(f"[ACMMCPClient] tool_result({tool_name}) empty_response")
         return {"error": "empty_response", "ok": False}
 
     # ------------------------------------------------------------------
