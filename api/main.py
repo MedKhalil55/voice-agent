@@ -69,12 +69,10 @@ async def _update_status_from_message_async(call_id: str, message_text: str) -> 
         payload = json.loads(message_text)
     except Exception:
         return
-
     if not isinstance(payload, dict):
         return
 
     msg_type = payload.get("type")
-
     if msg_type == "call_accepted":
         _safe_set_status(call_id, "accepted")
 
@@ -88,7 +86,12 @@ async def _update_status_from_message_async(call_id: str, message_text: str) -> 
         _safe_set_status(call_id, "ended")
         customer_id = active_calls.get(call_id, {}).get("customer_id")
         if customer_id and call_id not in agent_sessions:
-            await _free_call_status_db(customer_id, "Appel terminé côté client")
+            # Pas d'agent actif → appel terminé côté signaling uniquement
+            # Vérifier avant d'écraser un résultat existant
+            from db.tools import get_call_status
+            current = await run_in_threadpool(get_call_status, customer_id)
+            if current.get("status") not in ("PROMISED", "CALLBACK", "REFUSED", "KEPT"):
+                await _free_call_status_db(customer_id, "Appel terminé côté client")
 
     elif msg_type == "ringing":
         _safe_set_status(call_id, "ringing")
@@ -98,18 +101,14 @@ async def relay_messages(sender: WebSocket, receiver_getter, call_id: str, side:
     try:
         while True:
             data = await sender.receive_text()
-            await _update_status_from_message_async(call_id, data)
+            await _update_status_from_message_async(call_id, data)  # ← await direct
             receiver = receiver_getter()
             if receiver:
                 await receiver.send_text(data)
-
     except WebSocketDisconnect:
-        # ← MODIFIER : ne pas écraser "in_call" quand le dashboard se déconnecte
-        # Un refresh de page = déconnexion temporaire, pas fin d'appel
         current = active_calls.get(call_id, {}).get("status", "")
         if current not in ("rejected", "in_call", "accepted"):
             _safe_set_status(call_id, "ended")
-
 
 @app.websocket("/ws/agent/{call_id}")
 async def ws_agent(websocket: WebSocket, call_id: str):
@@ -269,23 +268,26 @@ async def audio_stream(websocket: WebSocket, call_id: str):
             pass
 
     async def on_agent_shutdown() -> None:
-        """Called by VoiceAgent when it wants to hang up."""
-
         from main import _log
-
         _log("[WS-AUDIO] Agent requested shutdown — closing WebSocket")
 
-        # Release DB call status — the agent hung up.
-        await _free_call_status_db(customer_id, "Agent a raccroché")
+        # ← Vérifier le statut APRÈS que main.py ait fini son shutdown()
+        # main.py écrit PROMISED/CALLBACK/REFUSED dans shutdown()
+        # on_agent_shutdown() est appelé APRÈS (voir _notify_when_safe_to_hangup)
+        # donc on lit ce que main.py a écrit
+        from db.tools import get_call_status
+        current = await run_in_threadpool(get_call_status, customer_id)
+        db_status = current.get("status", "FREE")
 
-        # Notify Angular client
+        # Ne mettre FREE que si main.py n'a pas déjà écrit un résultat
+        if db_status not in ("PROMISED", "CALLBACK", "REFUSED", "KEPT"):
+            await _free_call_status_db(customer_id, "Agent a raccroché sans résultat")
+
         try:
             await websocket.send_json({"type": "call_ended"})
-
         except Exception:
             pass
 
-        # Notify agent dashboard
         agent_ws = active_calls.get(call_id, {}).get("agent_ws")
         if agent_ws:
             try:
@@ -293,7 +295,6 @@ async def audio_stream(websocket: WebSocket, call_id: str):
             except Exception:
                 pass
 
-        # Notify signaling channel (phone emulator)
         client_ws = active_calls.get(call_id, {}).get("client_ws")
         if client_ws:
             try:
@@ -360,9 +361,10 @@ async def audio_stream(websocket: WebSocket, call_id: str):
                         agent_sessions[call_id].shutdown()
                         del agent_sessions[call_id]
                     active_calls[call_id]["status"] = "ended"
-                    await _free_call_status_db(
-                        customer_id, "Appel arrêté par le client"
-                    )
+                    from db.tools import get_call_status
+                    current = await run_in_threadpool(get_call_status, customer_id)
+                    if current.get("status") not in ("PROMISED", "CALLBACK", "REFUSED", "KEPT"):
+                        await _free_call_status_db(customer_id, "Appel arrêté par le client")
                     break
 
 
@@ -745,7 +747,6 @@ async def api_reject_call(call_id: str) -> CallStatusResponse:
         status=call.get("status", "rejected"),
         customer_id=call.get("customer_id"),
     )
-
 
 @app.post("/api/mcp/tool")
 async def call_mcp_tool_endpoint(
