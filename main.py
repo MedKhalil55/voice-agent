@@ -710,6 +710,10 @@ class VoiceAgent:
 
             if route == "ack" or transcript_norm in ACK_TOKENS:
                 system_msg = (
+                    "Tu es un agent de recouvrement bancaire tunisien au téléphone. "
+                    "Le client dit juste merci ou ok. Réponds en UNE seule phrase courte et naturelle. "
+                    "Exemples: 'De rien, bonne journée.' ou 'Avec plaisir.' ou 'Je vous en prie.' "
+                    "Ne pose pas de question. Ne propose pas d'aide supplémentaire. Maximum 5 mots."
                     "Parle comme un conseiller bancaire humain au téléphone. "
                     "Utilise un ton naturel, simple, et direct. "
                     "Évite les définitions académiques."

@@ -12,11 +12,19 @@ alive for the lifetime of the process.
 
 import asyncio
 import json
+import sys
 import threading
+from time import strftime
 from typing import Any, Optional
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+
+def _log(message: str) -> None:
+    """Timestamped, flushed logger so MCP activity shows up in FastAPI logs."""
+    print(f"[{strftime('%H:%M:%S')}] {message}", flush=True)
+
 
 
 class ACMMCPClient:
@@ -77,7 +85,8 @@ class ACMMCPClient:
         try:
             loop.run_until_complete(self._serve())
         except Exception as exc:  # noqa: BLE001
-            print(f"[ACMMCPClient] background loop error: {exc}")
+            _log(f"[ACMMCPClient] background loop error: {exc}")
+
         finally:
             try:
                 loop.close()
@@ -93,20 +102,27 @@ class ACMMCPClient:
 
         self._stop_event = asyncio.Event()
         try:
-            async with stdio_client(server_params) as (read_stream, write_stream):
+            # Forward the MCP server subprocess's stderr to this process's
+            # stderr so its [MCP-SERVER] tool-execution logs appear live in the
+            # FastAPI terminal.
+            async with stdio_client(server_params, errlog=sys.stderr) as (
+                read_stream,
+                write_stream,
+            ):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
                     self._session = session
                     self._connected = True
-                    print("[ACMMCPClient] connected to MCP server")
+                    _log("[ACMMCPClient] connected to MCP server")
                     self._ready.set()
 
                     # Keep the session open until shutdown is requested.
                     await self._stop_event.wait()
         except Exception as exc:  # noqa: BLE001
-            print(f"[ACMMCPClient] connection error: {exc}")
+            _log(f"[ACMMCPClient] connection error: {exc}")
             self._connected = False
             self._ready.set()
+
 
     # ------------------------------------------------------------------
     # Public synchronous API
@@ -114,7 +130,7 @@ class ACMMCPClient:
     def call_tool(self, tool_name: str, arguments: dict) -> dict:
         """Synchronous wrapper — safe to call from LangGraph nodes."""
         arguments = arguments or {}
-        print(f"[ACMMCPClient] call_tool({tool_name}, {arguments})")
+        _log(f"[MCP] → call_tool({tool_name}, {arguments})")
         try:
             self._ensure_connected()
             future = asyncio.run_coroutine_threadsafe(
@@ -123,8 +139,9 @@ class ACMMCPClient:
             )
             return future.result(timeout=30)
         except Exception as exc:  # noqa: BLE001
-            print(f"[ACMMCPClient] call_tool error: {exc}")
+            _log(f"[MCP] ✗ call_tool error ({tool_name}): {exc}")
             return {"error": str(exc), "ok": False}
+
 
     async def _call_tool_async(self, tool_name: str, arguments: dict) -> dict:
         if self._session is None:
@@ -138,15 +155,16 @@ class ACMMCPClient:
             if text is not None:
                 try:
                     parsed = json.loads(text)
-                    print(f"[ACMMCPClient] tool_result({tool_name}) = {parsed}")
+                    _log(f"[MCP] ✓ tool_result({tool_name}) = {parsed}")
                     if isinstance(parsed, dict):
                         return parsed
                     return {"result": parsed}
                 except json.JSONDecodeError:
-                    print(f"[ACMMCPClient] tool_result({tool_name}) raw_text = {text}")
+                    _log(f"[MCP] ✓ tool_result({tool_name}) raw_text = {text}")
                     return {"result": text}
 
-        print(f"[ACMMCPClient] tool_result({tool_name}) empty_response")
+        _log(f"[MCP] ✗ tool_result({tool_name}) empty_response")
+
         return {"error": "empty_response", "ok": False}
 
     # ------------------------------------------------------------------

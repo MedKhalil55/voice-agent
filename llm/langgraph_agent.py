@@ -2,7 +2,7 @@
 
 Flow:
 retrieve -> agent -> conditional
-  - "tool" -> tool_executor -> agent
+  - "tool" -> mcp_server -> agent
   - "done" -> speak -> END
 """
 
@@ -2158,7 +2158,7 @@ def build_voice_agent_graph():
 
     graph.add_node("retrieve", _retrieve_node)
     graph.add_node("agent", _agent_node)
-    graph.add_node("tool_executor", _tool_executor_node)
+    graph.add_node("mcp_server", _tool_executor_node)
     graph.add_node("speak", _speak_node)
 
     graph.set_entry_point("retrieve")
@@ -2168,11 +2168,11 @@ def build_voice_agent_graph():
         "agent",
         _route_after_agent,
         {
-            "tool": "tool_executor",
+            "tool": "mcp_server",
             "done": "speak",
         },
     )
-    graph.add_edge("tool_executor", "agent")
+    graph.add_edge("mcp_server", "agent")
     graph.add_edge("speak", END)
 
     return graph.compile()
