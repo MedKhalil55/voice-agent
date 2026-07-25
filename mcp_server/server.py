@@ -132,6 +132,21 @@ async def list_tools() -> list[Tool]:
                 "required": ["customer_id"],
             },
         ),
+        Tool(
+            name="set_call_status",
+            description="Met à jour le statut d'appel d'un client (FREE/IN_CALL/PROMISED/CALLBACK/REFUSED/BROKEN/KEPT)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "customer_id": {"type": "integer"},
+                    "status": {"type": "string"},
+                    "next_call_date": {"type": "string", "default": ""},
+                    "session_id": {"type": "string", "default": ""},
+                    "notes": {"type": "string", "default": ""},
+                },
+                "required": ["customer_id", "status"],
+            },
+        ),
     ]
 
 
@@ -217,6 +232,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "get_call_status":
             result = get_call_status(int(arguments["customer_id"]))
+
+        elif name == "set_call_status":
+            from db.tools import set_call_status
+            result = set_call_status(
+                customer_id=int(arguments["customer_id"]),
+                status=arguments["status"],
+                next_call_date=arguments.get("next_call_date") or None,
+                session_id=arguments.get("session_id", ""),
+                notes=arguments.get("notes", ""),
+            )
 
         else:
             result = {"error": f"unknown_tool: {name}"}

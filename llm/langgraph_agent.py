@@ -16,7 +16,6 @@ from pathlib import Path
 from importlib import import_module
 from typing import Dict, List, TypedDict
 
-from db.tools import create_claim, create_payment_promise, get_client_info, log_call
 
 try:
     # Package mode: python -m llm.langgraph_agent
@@ -692,6 +691,11 @@ def extract_date_from_transcript(transcript: str) -> date | None:
     except Exception:
         return None
 
+def _mcp(tool_name: str, arguments: dict) -> dict:
+    """Route all DB calls through MCP server."""
+    from llm.mcp_client import ACMMCPClient
+    mcp = ACMMCPClient.get_instance()
+    return mcp.call_tool(tool_name, arguments)
 
 def verify_identity(transcript: str, customer_id: int, attempts: int) -> dict:
     """Verify caller identity by matching spoken DOB against database DOB."""
@@ -699,10 +703,21 @@ def verify_identity(transcript: str, customer_id: int, attempts: int) -> dict:
     current_attempts = max(int(attempts or 0), 0)
     extracted_date = extract_date_from_transcript(transcript)
 
-    client_info = get_client_info(int(customer_id))
-    db_dob = client_info.get("date_de_naissance")
+    client_info = _mcp("get_client_info", {"customer_id": int(customer_id)})
+    db_dob_raw = client_info.get("date_de_naissance")
 
-    if isinstance(db_dob, date) and extracted_date is not None:
+    # MCP retourne une string ISO "1978-11-08", pas un objet date
+    if isinstance(db_dob_raw, str):
+        try:
+            db_dob = date.fromisoformat(db_dob_raw[:10])
+        except Exception:
+            db_dob = None
+    elif isinstance(db_dob_raw, date):
+        db_dob = db_dob_raw
+    else:
+        db_dob = None
+
+    if db_dob is not None and extracted_date is not None:
         is_match = (
             extracted_date.day == db_dob.day
             and extracted_date.month == db_dob.month
@@ -769,12 +784,14 @@ def classify_client_profile(client_info: dict) -> dict:
     }
 
 
-def extract_payment_date_from_transcript(transcript: str) -> str | None:
+def extract_payment_date_from_transcript(transcript: str, reference_date: date | None = None) -> str | None:
     source = (transcript or "").strip()
     if not source:
         return None
 
     today = date.today()
+    anchor = reference_date if reference_date is not None else today
+
 
     def _end_of_month(base: date) -> date:
         if base.month == 12:
@@ -931,13 +948,13 @@ def extract_payment_date_from_transcript(transcript: str) -> str | None:
     match = re.search(r"\b(\d{1,2})\s+du\s+mois\b", normalized)
     if match:
         day_value = int(match.group(1))
-        if today.day <= day_value:
-            parsed = _build_date(day_value, today.month, today.year)
+        if anchor.day <= day_value:
+            parsed = _build_date(day_value, anchor.month, anchor.year)
         else:
-            if today.month == 12:
-                parsed = _build_date(day_value, 1, today.year + 1)
+            if anchor.month == 12:
+                parsed = _build_date(day_value, 1, anchor.year + 1)
             else:
-                parsed = _build_date(day_value, today.month + 1, today.year)
+                parsed = _build_date(day_value, anchor.month + 1, anchor.year)
         if parsed is not None:
             return parsed.isoformat()
 
@@ -945,15 +962,16 @@ def extract_payment_date_from_transcript(transcript: str) -> str | None:
     match = re.search(r"\ble\s+(\d{1,2})\b", normalized)
     if match:
         day_value = int(match.group(1))
-        if today.day <= day_value:
-            parsed = _build_date(day_value, today.month, today.year)
+        if anchor.day <= day_value:
+            parsed = _build_date(day_value, anchor.month, anchor.year)
         else:
-            if today.month == 12:
-                parsed = _build_date(day_value, 1, today.year + 1)
+            if anchor.month == 12:
+                parsed = _build_date(day_value, 1, anchor.year + 1)
             else:
-                parsed = _build_date(day_value, today.month + 1, today.year)
+                parsed = _build_date(day_value, anchor.month + 1, anchor.year)
         if parsed is not None:
             return parsed.isoformat()
+
 
     # LLM fallback for hard spoken forms.
     import json
@@ -1078,7 +1096,17 @@ def _detect_intent_node(state: NegotiationState) -> dict:
     if "accepte pas" in normalized_user_text:
         strong_accept_like = False
 
-    extracted_date_precheck = extract_payment_date_from_transcript(user_text)
+    _prev_date_for_precheck = str(state.get("proposed_date") or "").strip()
+    _reference_for_precheck = None
+    if _prev_date_for_precheck:
+        try:
+            _reference_for_precheck = date.fromisoformat(_prev_date_for_precheck)
+        except Exception:
+            _reference_for_precheck = None
+
+    extracted_date_precheck = extract_payment_date_from_transcript(
+        user_text, reference_date=_reference_for_precheck
+    )
     date_counter_patterns = [
         r"\bdate\s+d\s*echeance\b",
         r"\bl\s*echeance\s+(?:le\s+)?\d{1,2}\b",
@@ -1167,8 +1195,17 @@ def _accept_node(state: NegotiationState) -> dict:
     inst = int(state.get("proposed_installments") or 0) or max_inst
     amount = float(state.get("proposed_amount") or 0.0) or suggested
 
-    extracted_date = extract_payment_date_from_transcript(user_text)
     current_date = str(state.get("proposed_date") or "").strip()
+    reference_date_obj = None
+    if current_date:
+        try:
+            reference_date_obj = date.fromisoformat(current_date)
+        except Exception:
+            reference_date_obj = None
+
+    extracted_date = extract_payment_date_from_transcript(
+        user_text, reference_date=reference_date_obj
+    )
     date_changed = bool(extracted_date and extracted_date != current_date)
     if extracted_date:
         current_date = extracted_date
@@ -1226,7 +1263,16 @@ def _counter_node(state: NegotiationState) -> dict:
     prev_amount = float(state.get("proposed_amount") or 0.0)
     prev_date = str(state.get("proposed_date") or "").strip()
 
-    extracted_date_early = extract_payment_date_from_transcript(user_text)
+    reference_date_obj = None
+    if prev_date:
+        try:
+            reference_date_obj = date.fromisoformat(prev_date)
+        except Exception:
+            reference_date_obj = None
+
+    extracted_date_early = extract_payment_date_from_transcript(
+        user_text, reference_date=reference_date_obj
+    )
     normalized_for_detection = _normalize_french_text(user_text)
     mentions_installments = bool(
         re.search(
@@ -1463,7 +1509,16 @@ def _refuse_node(state: NegotiationState) -> dict:
     # Guard: if we asked for an alternative date and the client provides one,
     # this is not a refusal escalation; keep the plan and ask for confirmation.
     if negotiation_step == "propose_alternative_date":
-        extracted_date = extract_payment_date_from_transcript(user_text)
+        _prev_date_str = str(state.get("proposed_date") or "").strip()
+        _reference_date_obj = None
+        if _prev_date_str:
+            try:
+                _reference_date_obj = date.fromisoformat(_prev_date_str)
+            except Exception:
+                _reference_date_obj = None
+        extracted_date = extract_payment_date_from_transcript(
+            user_text, reference_date=_reference_date_obj
+        )
         if extracted_date:
             profile = state.get("profile") or {}
             inst = int(state.get("proposed_installments") or 0) or int(
@@ -1998,68 +2053,6 @@ def _agent_node(state: AgentState) -> AgentState:
 def _decimal_safe(d: Dict) -> Dict:
     """Convert Decimal values to float for JSON serialization."""
     return {k: float(v) if isinstance(v, Decimal) else v for k, v in d.items()}
-
-
-def _real_account_lookup(args: Dict) -> Dict:
-    customer_id = args.get("customer_id") or args.get("query")
-    try:
-        customer_id = int(customer_id)
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "customer_id invalide"}
-
-    result = _decimal_safe(get_client_info(customer_id))
-    result["ok"] = bool(result.get("found", False))
-    result.setdefault("customer_id", customer_id)
-    result.setdefault("tool", "get_client_info")
-    return result
-
-
-def _real_payment_promise(args: Dict) -> Dict:
-    try:
-        result = create_payment_promise(
-            customer_id=int(args.get("customer_id", 0)),
-            amount=float(args.get("amount", 0)),
-            installments=int(args.get("installments", 1)),
-            promised_date=str(args.get("promised_date", "")),
-        )
-        result["ok"] = bool(result.get("success", False))
-        result.setdefault("tool", "create_payment_promise")
-        return result
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-def _real_log_call(args: Dict) -> Dict:
-    try:
-        result = log_call(
-            customer_id=int(args.get("customer_id", 0)),
-            transcript=str(args.get("transcript", "")),
-            intent=str(args.get("intent", "")),
-            outcome=str(args.get("outcome", "completed")),
-            agent_decision=str(args.get("agent_decision", ""))[:500],
-        )
-        result["ok"] = bool(result.get("success", False))
-        result.setdefault("tool", "log_call")
-        return result
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-def _real_create_claim(args: Dict) -> Dict:
-    try:
-        result = create_claim(
-            customer_id=int(args.get("customer_id", 0)),
-            subject=str(args.get("subject", "")),
-            body=str(args.get("body", "")),
-            name=str(args.get("name", "")),
-            phone=str(args.get("phone", "")),
-            email=str(args.get("email", "")),
-        )
-        result["ok"] = bool(result.get("success", False))
-        result.setdefault("tool", "create_claim")
-        return result
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
 
 
 def _tool_executor_node(state: AgentState) -> AgentState:

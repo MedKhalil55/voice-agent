@@ -466,6 +466,7 @@ class CallLogEntry(_BaseModel):
 class PaymentPromiseEntry(_BaseModel):
     id: int
     customer_id: int
+    customer_name: Optional[str] = None
     amount: Optional[float] = None
     installments: Optional[int] = None
     promised_date: Optional[date] = None
@@ -604,21 +605,23 @@ async def api_get_promises(
 ) -> list[PaymentPromiseEntry]:
     sql = """
     SELECT
-        id,
-        customer_id,
-        amount,
-        installments,
-        promised_date,
-        status,
-        created_at,
-        reason,
-        reason_raw
-    FROM acm_payment_promise
+        pp.id,
+        pp.customer_id,
+        c.customer_name,
+        pp.amount,
+        pp.installments,
+        pp.promised_date,
+        pp.status,
+        pp.created_at,
+        pp.reason,
+        pp.reason_raw
+    FROM acm_payment_promise pp
+    LEFT JOIN acm_customer c ON c.customer_id_extern = pp.customer_id
     """
 
     params: tuple[Any, ...] | None = None
     if customer_id is not None:
-        sql += " WHERE customer_id = %s"
+        sql += " WHERE pp.customer_id = %s"
         params = (customer_id,)
 
     try:
@@ -626,7 +629,6 @@ async def api_get_promises(
         return [PaymentPromiseEntry(**row) for row in rows]
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"DB error: {exc}") from exc
-
 
 @app.get("/api/claims", response_model=list[ClaimEntry])
 async def api_get_claims(
@@ -785,6 +787,60 @@ async def call_mcp_tool_endpoint(
         raise HTTPException(status_code=500, detail=f"MCP error: {exc}")
 
 
+@app.get("/api/stats/call-sessions-count")
+async def api_get_call_sessions_count() -> dict:
+    try:
+        rows = await run_in_threadpool(
+            _fetch_all, "SELECT COUNT(DISTINCT session_id) AS total FROM acm_call_log"
+        )
+        return {"total_sessions": rows[0]["total"] if rows else 0}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+@app.get("/api/stats/refusal-funnel")
+async def api_get_refusal_funnel() -> dict:
+    try:
+        rows = await run_in_threadpool(
+            _fetch_all,
+            """
+            SELECT
+                CASE outcome
+                    WHEN 'refuse_stage_1_alternative_date' THEN 'propose_alternative_date'
+                    WHEN 'refuse_stage_2_acompte' THEN 'propose_acompte'
+                    WHEN 'refuse_stage_3_rappel' THEN 'propose_rappel'
+                    ELSE outcome
+                END AS normalized_outcome,
+                COUNT(DISTINCT session_id) AS count
+            FROM acm_call_log
+            WHERE intent = 'negotiation_refuse'
+              AND outcome IN (
+                  'propose_alternative_date', 'refuse_stage_1_alternative_date',
+                  'propose_acompte', 'refuse_stage_2_acompte',
+                  'propose_rappel', 'refuse_stage_3_rappel',
+                  'hangup'
+              )
+            GROUP BY normalized_outcome
+            """
+        )
+        return {row["normalized_outcome"]: row["count"] for row in rows}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}") 
+@app.get("/api/stats/call-volume-by-day")
+async def api_get_call_volume_by_day() -> dict:
+    try:
+        rows = await run_in_threadpool(
+            _fetch_all,
+            """
+            SELECT DATE(call_date) AS day, COUNT(DISTINCT session_id) AS count
+            FROM acm_call_log
+            GROUP BY DATE(call_date)
+            ORDER BY day
+            """
+        )
+        return {str(row["day"]): row["count"] for row in rows}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+          
 if __name__ == "__main__":
     import uvicorn
 

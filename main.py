@@ -221,7 +221,15 @@ def _parse_float_env(name: str, default: float) -> float:
         return default
 
 
+def _mcp(tool_name: str, arguments: dict) -> dict:
+    """Single entry point for all MCP tool calls from main.py."""
+    from llm.mcp_client import ACMMCPClient
+    mcp = ACMMCPClient.get_instance()
+    return mcp.call_tool(tool_name, arguments)
+
+
 class VoiceAgent:
+
     """Voice agent that continuously listens and responds.
 
     Concurrency model
@@ -356,9 +364,7 @@ class VoiceAgent:
         # Récupérer le nom du client AVANT le greeting
         client_name = ""
         try:
-            from db.tools import get_client_info
-
-            info = get_client_info(self._customer_id)
+            info = _mcp("get_client_info", {"customer_id": self._customer_id})
             if info.get("found"):
                 self._client_info = info
                 client_name = str(info.get("customer_name", "")).strip()
@@ -367,14 +373,12 @@ class VoiceAgent:
 
         # Mark call as in-progress.
         try:
-            from db.tools import set_call_status
-
-            set_call_status(
-                customer_id=self._customer_id,
-                status="IN_CALL",
-                session_id=self._session_id,
-                notes="Appel en cours",
-            )
+            _mcp("set_call_status", {
+                "customer_id": self._customer_id,
+                "status": "IN_CALL",
+                "session_id": self._session_id,
+                "notes": "Appel en cours",
+            })
         except Exception as exc:
             _log(f"[CALL_STATUS] set IN_CALL failed: {exc}")
 
@@ -488,9 +492,7 @@ class VoiceAgent:
 
     def _preload_client_info(self) -> None:
         try:
-            from db.tools import get_client_info
-
-            info = get_client_info(self._customer_id)
+            info = _mcp("get_client_info", {"customer_id": self._customer_id})
             if info.get("found"):
                 self._client_info = info
                 self._negotiation_profile = classify_client_profile(info)
@@ -842,17 +844,15 @@ class VoiceAgent:
             _log(f"Assistant: {assistant_text!r}")
 
             try:
-                from db.tools import log_call
-
-                log_call(
-                    customer_id=state.get("customer_id") or self._customer_id,
-                    transcript=user_text,
-                    intent=route,
-                    outcome="completed",
-                    agent_decision=assistant_text[:500],
-                    session_id=self._session_id,
-                    turn_number=current_turn,
-                )
+                _mcp("log_call", {
+                    "customer_id": state.get("customer_id") or self._customer_id,
+                    "transcript": user_text,
+                    "intent": route,
+                    "outcome": "completed",
+                    "agent_decision": assistant_text[:500],
+                    "session_id": self._session_id,
+                    "turn_number": current_turn,
+                })
             except Exception as log_exc:
                 _log(f"[DB] log_call failed: {log_exc}")
 
@@ -913,9 +913,7 @@ class VoiceAgent:
 
             if not client:
                 try:
-                    from db.tools import get_client_info
-
-                    info = get_client_info(self._customer_id)
+                    info = _mcp("get_client_info", {"customer_id": self._customer_id})
                     if info.get("found"):
                         self._client_info = info
                         client = info
@@ -987,6 +985,15 @@ class VoiceAgent:
             generated_text = " ".join(generated_sentences).strip()
             if generated_text:
                 _log(f"Assistant: {generated_text!r}")
+
+            # CRITICAL: persister le plan proposé immédiatement après l'avoir
+            # présenté au client. Sans ça, self._proposed_amount reste à 0.0
+            # jusqu'à la première contre-proposition/acceptation, et toute
+            # réclamation déposée AVANT ce moment-là ne peut pas afficher de
+            # récap correct dans _save_claim() (condition proposed_amount > 0).
+            self._proposed_installments = max_inst
+            self._proposed_amount = suggested
+            self._proposed_date = first_date
 
             self._negotiation_step = "await_confirmation"
             return generated_text
@@ -1272,36 +1279,79 @@ class VoiceAgent:
 
     def _handle_name_confirmation(self, user_text: str, turn_number: int) -> None:
         from llm.agent import call_llm_raw
+        import unicodedata as _ud
 
-        # LLM détecte si le client confirme son identité
-        confirm_prompt = (
-            "Le client répond à la question 'Ai-je bien X en ligne ?'. "
-            "Détecte sa réponse. "
-            "yes: oui, c'est moi, exact, bien sûr, affirmatif, oui c'est bien moi. "
-            "no: non, vous faites erreur, mauvais numéro, ce n'est pas moi. "
-            "other: réponse incompréhensible ou hors sujet. "
-            'Réponds uniquement en JSON: {"confirm": "yes"|"no"|"other"}'
+        def _norm(text: str) -> str:
+            normalized = _ud.normalize("NFKD", (text or "").lower())
+            normalized = "".join(ch for ch in normalized if not _ud.combining(ch))
+            normalized = normalized.replace("'", " ")
+            normalized = re.sub(r"[^a-z0-9\s\-]", " ", normalized)
+            normalized = re.sub(r"\s+", " ", normalized).strip()
+            return normalized
+
+        user_norm = _norm(user_text)
+
+        # Deterministic fast-path BEFORE calling the LLM.
+        # Why: with only num_predict=32, the local LLM sometimes fails to
+        # return valid/complete JSON for slightly longer answers like
+        # "oui c'est moi" or "oui je suis Khalil", silently falling back to
+        # "other" even though the intent is obvious. Catch the clear cases
+        # here first; only ambiguous text goes to the LLM.
+        NO_MARKERS = (
+            "non",
+            "mauvais numero",
+            "pas moi",
+            "vous faites erreur",
+            "ce n est pas moi",
+        )
+        YES_MARKERS = (
+            "oui",
+            "exact",
+            "affirmatif",
+            "c est bien moi",
+            "c est moi",
+            "bien sur",
+            "tout a fait",
         )
 
-        raw = call_llm_raw(
-            [
-                {"role": "system", "content": confirm_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            num_predict=32,
-            temperature=0.0,
-        )
+        confirm = None
+        if any(m in user_norm for m in NO_MARKERS):
+            confirm = "no"
+        elif any(m in user_norm for m in YES_MARKERS) or re.search(
+            r"\bje\s+suis\b", user_norm
+        ):
+            confirm = "yes"
 
-        import json as _json
+        if confirm is None:
+            # LLM détecte si le client confirme son identité
+            confirm_prompt = (
+                "Le client répond à la question 'Ai-je bien X en ligne ?'. "
+                "Détecte sa réponse. "
+                "yes: oui, c'est moi, exact, bien sûr, affirmatif, oui c'est bien moi. "
+                "no: non, vous faites erreur, mauvais numéro, ce n'est pas moi. "
+                "other: réponse incompréhensible ou hors sujet. "
+                'Réponds uniquement en JSON: {"confirm": "yes"|"no"|"other"}'
+            )
 
-        confirm = "other"
-        try:
-            match = re.search(r"\{.*?\}", raw or "", flags=re.DOTALL)
-            if match:
-                parsed = _json.loads(match.group(0))
-                confirm = str(parsed.get("confirm", "other")).strip()
-        except Exception:
-            pass
+            raw = call_llm_raw(
+                [
+                    {"role": "system", "content": confirm_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                num_predict=32,
+                temperature=0.0,
+            )
+
+            import json as _json
+
+            confirm = "other"
+            try:
+                match = re.search(r"\{.*?\}", raw or "", flags=re.DOTALL)
+                if match:
+                    parsed = _json.loads(match.group(0))
+                    confirm = str(parsed.get("confirm", "other")).strip()
+            except Exception:
+                pass
 
         client_name = str((self._client_info or {}).get("customer_name", "")).strip()
 
@@ -1393,30 +1443,24 @@ class VoiceAgent:
         intent: str = "negotiation_save",
     ) -> None:
         try:
-            from db.tools import create_payment_promise
-
-            result = create_payment_promise(
-                customer_id=self._customer_id,
-                amount=self._proposed_amount,
-                installments=self._proposed_installments,
-                promised_date=self._proposed_date,
-                reason=self._client_reason,
-                reason_raw=self._client_reason_raw,
-            )
+            result = _mcp("create_payment_promise", {
+                "customer_id": self._customer_id,
+                "amount": self._proposed_amount,
+                "installments": self._proposed_installments,
+                "promised_date": self._proposed_date,
+                "reason": self._client_reason,
+                "reason_raw": self._client_reason_raw,
+            })
             if result.get("success") or result.get("ok"):
                 # Block calls until promised_date
                 try:
-                    from db.tools import set_call_status
-
-                    set_call_status(
-                        customer_id=self._customer_id,
-                        status="PROMISED",
-                        next_call_date=self._proposed_date,
-                        session_id=self._session_id,
-                        notes=(
-                            f"Promesse: {self._proposed_installments}x{self._proposed_amount}DT"
-                        ),
-                    )
+                    _mcp("set_call_status", {
+                        "customer_id": self._customer_id,
+                        "status": "PROMISED",
+                        "next_call_date": self._proposed_date,
+                        "session_id": self._session_id,
+                        "notes": f"Promesse: {self._proposed_installments}x{self._proposed_amount}DT",
+                    })
                 except Exception as exc:
                     _log(f"[CALL_STATUS] set PROMISED failed: {exc}")
 
@@ -1543,19 +1587,18 @@ class VoiceAgent:
             return
 
     def _save_claim(self, turn_number: int) -> None:
-        from db.tools import create_claim
-
         client = self._client_info or {}
         claim_transcript = self._claim_body
         try:
-            result = create_claim(
-                customer_id=self._customer_id,
-                subject=self._claim_subject,
-                body=self._claim_body,
-                name=str(client.get("customer_name", "")),
-                phone=str(client.get("telephone_1", "")),
-                email=str(client.get("email", "")),
-            )
+            result = _mcp("create_claim", {
+                "customer_id": self._customer_id,
+                "subject": self._claim_subject,
+                "body": self._claim_body,
+                "name": str(client.get("customer_name", "")),
+                "phone": str(client.get("telephone_1", "")),
+                "email": str(client.get("email", "")),
+            })
+
             if result.get("success"):
                 claim_id = result.get("id_acm_claims", "")
                 msg = (
@@ -1638,17 +1681,15 @@ class VoiceAgent:
         turn_number: int | None = None,
     ) -> None:
         try:
-            from db.tools import log_call
-
-            log_call(
-                customer_id=self._customer_id,
-                transcript=transcript,
-                intent=intent,
-                outcome=outcome,
-                agent_decision=(agent_decision or "")[:500],
-                session_id=self._session_id,
-                turn_number=int(turn_number or self._turn_number or 1),
-            )
+            _mcp("log_call", {
+                "customer_id": self._customer_id,
+                "transcript": transcript,
+                "intent": intent,
+                "outcome": outcome,
+                "agent_decision": (agent_decision or "")[:500],
+                "session_id": self._session_id,
+                "turn_number": int(turn_number or self._turn_number or 1),
+            })
         except Exception as log_exc:
             _log(f"[DB] log_call event failed: {log_exc}")
 
@@ -1710,14 +1751,12 @@ class VoiceAgent:
         # Persist call status based on negotiation outcome.
         # This must never block shutdown.
         try:
-            from db.tools import get_call_status, set_call_status
             from datetime import date, timedelta
 
             current_status = ""
             try:
-                current_status = str(
-                    (get_call_status(self._customer_id) or {}).get("status") or ""
-                ).strip()
+                result = _mcp("get_call_status", {"customer_id": self._customer_id})
+                current_status = str((result or {}).get("status") or "").strip()
             except Exception:
                 current_status = ""
 
@@ -1729,43 +1768,35 @@ class VoiceAgent:
                 "propose_rappel",
                 "done",
             ):
-                set_call_status(
-                    customer_id=self._customer_id,
-                    status="CALLBACK",
-                    next_call_date=(date.today() + timedelta(days=15)).isoformat(),
-                    session_id=self._session_id,
-                    notes="Rappel demandé dans 15 jours",
-                )
+                _mcp("set_call_status", {
+                    "customer_id": self._customer_id,
+                    "status": "CALLBACK",
+                    "next_call_date": (date.today() + timedelta(days=15)).isoformat(),
+                    "session_id": self._session_id,
+                    "notes": "Rappel demandé dans 15 jours",
+                })
             elif self._negotiation_step == "done":
-                # Done without PROMISED (fallback) -> FREE
-                set_call_status(
-                    customer_id=self._customer_id,
-                    status="FREE",
-                    session_id=self._session_id,
-                    notes="Appel terminé — retour libre",
-                )
+                _mcp("set_call_status", {
+                    "customer_id": self._customer_id,
+                    "status": "FREE",
+                    "session_id": self._session_id,
+                    "notes": "Appel terminé — retour libre",
+                })
             elif self._negotiation_refusals >= 4:
-                # Total refusal — block 7 days
-                set_call_status(
-                    customer_id=self._customer_id,
-                    status="REFUSED",
-                    next_call_date=(date.today() + timedelta(days=7)).isoformat(),
-                    session_id=self._session_id,
-                    notes="Refus total après 4 tentatives",
-                )
+                _mcp("set_call_status", {
+                    "customer_id": self._customer_id,
+                    "status": "REFUSED",
+                    "next_call_date": (date.today() + timedelta(days=7)).isoformat(),
+                    "session_id": self._session_id,
+                    "notes": "Refus total après 4 tentatives",
+                })
             else:
-                # All other cases → FREE
-                # Covers:
-                # - Failed identity verification (not self._verified)
-                # - Wrong number / name confirmation = no
-                # - Call ended mid-negotiation
-                # - DOB failed 3 times
-                set_call_status(
-                    customer_id=self._customer_id,
-                    status="FREE",
-                    session_id=self._session_id,
-                    notes="Appel terminé — retour libre",
-                )
+                _mcp("set_call_status", {
+                    "customer_id": self._customer_id,
+                    "status": "FREE",
+                    "session_id": self._session_id,
+                    "notes": "Appel terminé — retour libre",
+                })
         except Exception as exc:
             _log(f"[CALL_STATUS] shutdown status update failed: {exc}")
 
