@@ -1,13 +1,24 @@
+# Voice-Agent — AI Agentic Voice Assistant
 
-# Voice-Agent (local voice assistant)
+> **Branch note:** the `main` branch contains the original local voice-assistant pipeline. The **`mcpBranch`** branch is the final, most complete version of this project — it extends the pipeline into a full **agentic AI system** with **LangGraph** orchestration, a **RAG** knowledge-retrieval layer, and **MCP (Model Context Protocol)** tool integration. Check out `mcpBranch` to see the full implementation.
 
-Local-only voice assistant pipeline:
+A local-first, end-to-end voice AI agent: it listens, reasons over retrieved knowledge, can call tools through MCP, and speaks back — all orchestrated as an agentic workflow rather than a single prompt-response loop.
 
-1) Record microphone audio (WAV)
-2) Transcribe with Whisper (faster-whisper)
-3) Generate a response with Ollama (LangChain)
-4) Synthesize speech with Piper (recommended: standalone `piper.exe` on Windows)
-5) Play the audio response
+## Pipeline overview (mcpBranch)
+
+1. **Capture** — record microphone audio (WAV / streaming chunks)
+2. **Transcribe** — speech-to-text with Whisper (`faster-whisper`)
+3. **Retrieve** — relevant context is pulled from a **RAG** pipeline backed by **ChromaDB**
+4. **Reason & orchestrate** — a **LangGraph** agent graph drives multi-step reasoning over an LLM (via Ollama), deciding when to retrieve, when to call a tool, and when to respond
+5. **Act** — the agent can invoke external tools/capabilities through **MCP (Model Context Protocol)**, rather than being limited to text generation alone
+6. **Synthesize** — the response is converted back to speech with Piper TTS
+7. **Play** — the audio response is played back to the user
+
+This turns the original single-shot voice pipeline (`main` branch: Whisper → LangChain → Piper) into a genuine **agentic voice assistant**, capable of retrieval-augmented, tool-using, multi-step reasoning in a live conversation.
+
+## Why this project
+
+This started as a local voice-assistant experiment and evolved into a testbed for agentic AI patterns — LangGraph-based orchestration, RAG retrieval, and MCP tool calling — applied to a real-time, low-latency voice interface. It's the foundation for the AI voice agent architecture used in my Talys Consulting internship project.
 
 ## Prerequisites
 
@@ -15,6 +26,8 @@ Local-only voice assistant pipeline:
 - `uv` installed
 - Ollama installed and running (default: `http://localhost:11434`)
 - A Piper voice model (`.onnx` + `.onnx.json`)
+- ChromaDB (for the RAG layer — see `mcpBranch`)
+- An MCP-compatible tool/server configuration (see `mcpBranch`)
 
 ## Configuration (.env)
 
@@ -37,19 +50,15 @@ VOICE_AGENT_WHISPER_BEAM_SIZE=1
 # Stop recording when the speaker is silent for N seconds.
 VOICE_AGENT_RECORD_STOP_ON_SILENCE_SECONDS=3
 
-# Optional: maximum recording time per turn when stop-on-silence is enabled.
-# Useful if you speak for a long time without pausing.
+# Optional
 # VOICE_AGENT_RECORD_MAX_SECONDS=30
-
-# Optional tuning
 # VOICE_AGENT_SILENCE_RMS_THRESHOLD=0.01
 # VOICE_AGENT_MIN_RECORD_SECONDS=0.6
-
-# Optional (Windows troubleshooting): force the correct microphone input device.
-# You can set either an integer device index or an exact device name.
 # VOICE_AGENT_AUDIO_INPUT_DEVICE=1
 # VOICE_AGENT_AUDIO_INPUT_DEVICE=Microphone (Realtek(R) Audio)
 ```
+
+> On `mcpBranch`, additional environment variables are required for the ChromaDB RAG store and MCP server connection — see that branch's README/config for the full list.
 
 Notes:
 - Relative paths like `voices/...` are resolved relative to the project root.
@@ -62,6 +71,8 @@ From the project root:
 ```
 uv run main.py
 ```
+
+For the full agentic pipeline (LangGraph + RAG + MCP), switch to `mcpBranch` and follow its setup instructions.
 
 ## Streaming transcription (real-time partials)
 
@@ -87,7 +98,7 @@ Outputs are written to the `artifacts/` folder (for example: `artifacts/user.wav
 - If you speak English but transcription comes out in Arabic/Russian/etc, set:
 	- `VOICE_AGENT_WHISPER_LANGUAGE=en`
 	- and optionally use an English-only model like `VOICE_AGENT_WHISPER_MODEL=small.en`
-- If the transcript sounds like it is hearing the **speaker output** (the assistant) instead of your voice, your input device may be wrong (e.g., Windows “Stereo Mix”).
+- If the transcript sounds like it is hearing the **speaker output** (the assistant) instead of your voice, your input device may be wrong (e.g., Windows "Stereo Mix").
 	- Listen to `artifacts/user.wav` to confirm what was actually recorded.
 	- Set `VOICE_AGENT_AUDIO_INPUT_DEVICE` to your real microphone.
 
@@ -106,7 +117,7 @@ If your "temps de réponse" feels too slow, the total latency is usually the sum
 
 - Stop-on-silence delay (often up to 1–3s)
 - STT decode time (Whisper)
-- LLM generation time (Ollama)
+- Agent reasoning time (LangGraph + LLM, plus any RAG retrieval / MCP tool calls)
 - TTS synthesis time (Piper)
 
 Recommended knobs (keep quality good, reduce latency):
@@ -136,7 +147,7 @@ Recommended knobs (keep quality good, reduce latency):
 	- `VOICE_AGENT_WHISPER_VAD_FILTER=true`
 	- `VOICE_AGENT_STT_USE_NUMPY_WAV=true`
 
-3) LLM (Ollama)
+3) LLM / Agent (Ollama + LangGraph)
 
 - Cap output tokens to force shorter answers (faster + less audio playback):
 	- `VOICE_AGENT_OLLAMA_NUM_PREDICT=120` (try 96 if you want even shorter)
@@ -159,3 +170,7 @@ This explicitly loads `.env` and synthesizes a WAV:
 uv run python -c "from dotenv import load_dotenv; load_dotenv(); from tts import synthesize_speech; synthesize_speech('Hello!', 'artifacts/tts_test.wav')"
 ```
 
+## Roadmap / branches
+
+- `main` — core local pipeline: Whisper → LLM (LangChain) → Piper
+- `mcpBranch` **(final / recommended)** — full agentic version: Whisper → RAG (ChromaDB) → LangGraph agent orchestration → MCP tool calling → Piper
