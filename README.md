@@ -4,9 +4,14 @@
 
 A local-first, end-to-end **voice AI agent**. It listens, retrieves knowledge from documents, reasons over multiple steps, calls external tools through MCP, and speaks back, all orchestrated as an agentic workflow rather than a single prompt-response loop.
 
-[![Voir la démo](dashboard.png)]
-**Frontend (Angular dashboard):** [voice-agent-front](https://github.com/MedKhalil55/voice-agent-front)
+## Screenshots
 
+<p align="center">
+  <img src="dashboard.png" alt="Angular dashboard for agent supervision and call tracking" width="48%">
+  <img src="emulator.png" alt="Emulator view of the voice agent" width="48%">
+</p>
+
+**Frontend (Angular dashboard):** [voice-agent-front](https://github.com/MedKhalil55/voice-agent-front)
 ## Key features
 
 - **Fully local pipeline**: speech-to-text, LLM and text-to-speech run on your machine (Faster-Whisper, Ollama, Piper).
