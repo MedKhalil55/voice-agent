@@ -69,19 +69,6 @@ uv run main.py
 - ChromaDB for the RAG layer
 - An MCP-compatible tool/server configuration
 
-## Results
-
-
-| Metric | Value | How it was measured |
-|---|---|---|
-| End-to-end latency per turn | _TBD_ | _e.g. average over N turns on <hardware>_ |
-| STT time (Whisper) | _TBD_ | |
-| LLM time (LangGraph + Ollama) | _TBD_ | |
-| TTS time (Piper) | _TBD_ | |
-| RAG answer accuracy | _TBD_ | _e.g. N test questions, manually verified_ |
-| Tool-calling success rate | _TBD_ | _e.g. N scenarios_ |
-
-**Test hardware:** _TBD_
 
 ## Configuration
 
